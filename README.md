@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.5.16-blue.svg)](https://github.com/liuer-net/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.5.18-blue.svg)](https://github.com/liuer-net/liuer-panel/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A lightweight CLI-based web server control panel for Linux servers. Manage websites, databases, SSL, PHP versions, backups, and more — all from your terminal.
@@ -64,9 +64,12 @@ liuer help           # Show help
 ### Website Management
 - Create PHP / Laravel / WordPress / Static sites
 - Auto-generate Nginx config with security headers
-- SSL via Let's Encrypt (auto-renewal included)
+- SSL via Let's Encrypt (auto-renewal included) — install/renew anytime per site
 - Switch PHP version per site
+- Upload & timeout settings per site (`client_max_body_size`, `fastcgi_read_timeout`, `upload_max_filesize`, `memory_limit`, etc.)
 - View site details (PHP socket, SSL expiry, DB info, framework detection)
+- Lock / Unlock site
+- SFTP user management — auto or manual mode
 
 ### Database
 - MySQL / MariaDB / PostgreSQL support
@@ -94,6 +97,8 @@ liuer help           # Show help
 - Start / Stop / Restart / Enable / Disable any service
 - View status of all services
 - Install extra services (Redis, Memcached, PostgreSQL, Fail2ban, ClamAV, Certbot)
+- Hardware & system info (CPU, RAM, disk, network interfaces, uptime)
+- Disk benchmark — sequential read/write speed test via `dd`
 
 ### Updates
 - `liuer update` — pulls latest version from GitHub with auto-rollback on failure
