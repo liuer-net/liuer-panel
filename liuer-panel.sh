@@ -3067,7 +3067,7 @@ show_version() {
 }
 
 _fetch_remote_ver() {
-    local ver_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/version.txt"
+    local ver_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/version.txt?$(date +%s)"
     local v
     v=$(curl -fsSL --max-time 10 "$ver_url" 2>/dev/null | tr -d '[:space:]')
     echo "$v"
@@ -3096,7 +3096,7 @@ check_update() {
 update_tool() {
     print_section "UPDATE LIUER PANEL"
 
-    local raw_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/${SCRIPT_NAME}"
+    local raw_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/${SCRIPT_NAME}?$(date +%s)"
     local target="${INSTALL_DIR}/${SCRIPT_NAME}"
 
     log_info "Fetching remote version..."
