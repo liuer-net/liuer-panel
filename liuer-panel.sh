@@ -3069,10 +3069,10 @@ show_version() {
 check_update() {
     print_section "CHECK FOR UPDATES"
 
-    local api_url="https://api.github.com/repos/liuer-net/liuer-panel/contents/${SCRIPT_NAME}"
+    local raw_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/${SCRIPT_NAME}"
     log_info "Fetching remote version..."
     local remote_ver
-    remote_ver=$(curl -fsSL -H "Accept: application/vnd.github.raw" "$api_url" 2>/dev/null \
+    remote_ver=$(curl -fsSL --max-time 10 "$raw_url" 2>/dev/null \
                  | grep -oP '(?<=readonly VERSION=")[^"]+' | head -1 || true)
 
     if [[ -z "$remote_ver" ]]; then
@@ -3092,12 +3092,12 @@ check_update() {
 update_tool() {
     print_section "UPDATE LIUER PANEL"
 
-    local api_url="https://api.github.com/repos/liuer-net/liuer-panel/contents/${SCRIPT_NAME}"
+    local raw_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/${SCRIPT_NAME}"
     local target="${INSTALL_DIR}/${SCRIPT_NAME}"
 
     log_info "Fetching remote version..."
     local remote_ver
-    remote_ver=$(curl -fsSL -H "Accept: application/vnd.github.raw" "$api_url" 2>/dev/null \
+    remote_ver=$(curl -fsSL --max-time 10 "$raw_url" 2>/dev/null \
                  | grep -oP '(?<=readonly VERSION=")[^"]+' | head -1 || true)
 
     if [[ -z "$remote_ver" ]]; then
@@ -3110,7 +3110,7 @@ update_tool() {
         press_enter; return 0
     fi
 
-    echo -e "${BOLD}Updating: ${BOLD}v${VERSION}${NC}${BOLD} → ${BOLD}v${remote_ver}${NC}\n"
+    echo -e "${BOLD}Updating: v${VERSION}${NC} → ${BOLD}v${remote_ver}${NC}\n"
     confirm_action "Proceed with update?" || { log_info "Cancelled."; return 0; }
 
     local backup_path="/tmp/liuer-panel-backup-$(date +%Y%m%d_%H%M%S).sh"
@@ -3119,8 +3119,9 @@ update_tool() {
         || { log_error "Backup failed. Aborting."; return 1; }
 
     log_info "Downloading v${remote_ver}..."
-    if curl -fsSL -H "Accept: application/vnd.github.raw" "$api_url" -o "${target}.tmp" 2>/dev/null \
-       && [[ -s "${target}.tmp" ]]; then
+    if curl -fsSL --max-time 60 "$raw_url" -o "${target}.tmp" 2>/dev/null \
+       && [[ -s "${target}.tmp" ]] \
+       && grep -q 'readonly VERSION=' "${target}.tmp"; then
         mv "${target}.tmp" "$target"
         chmod +x "$target"
         ln -sf "$target" "$BIN_LINK"
