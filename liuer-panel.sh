@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.28"
+readonly VERSION="2.5.29"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -372,8 +372,14 @@ _set_site_perms() {
     # Reset top-level dir to root:root 755 — required for SFTP ChrootDirectory
     chown root:root "$site_dir" 2>/dev/null || true
     chmod 755 "$site_dir"
-    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
-    find "$site_dir" -type f -exec chmod 640 {} \;
+    # If site has SFTP users, keep group-writable so they can upload
+    if grep -q "ChrootDirectory ${site_dir}" /etc/ssh/sshd_config 2>/dev/null; then
+        find "$site_dir" -mindepth 1 -type d -exec chmod 770 {} \;
+        find "$site_dir" -type f -exec chmod 660 {} \;
+    else
+        find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
+        find "$site_dir" -type f -exec chmod 640 {} \;
+    fi
     # Add nginx to site group — restart required (not just reload) to apply new group
     if ! groups "$nginx_user" 2>/dev/null | grep -qw "$site_user"; then
         usermod -aG "$site_user" "$nginx_user" 2>/dev/null || true
