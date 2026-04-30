@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.30"
+readonly VERSION="2.5.31"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -396,10 +396,13 @@ _repair_sftp_perms() {
                 chown root:root "$_croot" && chmod 755 "$_croot"
                 find "$_croot" -mindepth 1 -type d -exec chmod 770 {} \; 2>/dev/null || true
                 find "$_croot" -mindepth 1 -type f -exec chmod 660 {} \; 2>/dev/null || true
-                # Re-ensure sftp_user is in the group owning files inside chroot
+                # Fix group membership: primary group = web group (reliable, always active)
                 local _grp; _grp=$(find "$_croot" -mindepth 1 -maxdepth 1 -type d \
-                    -exec stat -c '%G' {} \; 2>/dev/null | grep -v '^root$' | head -1)
+                    -exec stat -c '%G' {} \; 2>/dev/null | grep -v '^root$' | head -1 || true)
                 if [[ -n "$_grp" ]] && getent group "$_grp" &>/dev/null; then
+                    # Change primary group (more reliable than supplementary for chroot SFTP)
+                    usermod -g "$_grp" "$_sfuser" 2>/dev/null || true
+                    # Also keep as supplementary for redundancy
                     usermod -aG "$_grp" "$_sfuser" 2>/dev/null || true
                 fi
             fi
@@ -4131,14 +4134,19 @@ create_sftp_user() {
         0|*) return ;;
     esac
 
-    useradd -M -d "$_sfsite" -s /sbin/nologin "$_sfuser" 2>/dev/null \
-        || { log_error "Failed to create system user."; press_enter; return 1; }
-
-    echo "${_sfuser}:${_sfpass}" | chpasswd
-
     local _web_user; _web_user=$(grep 'WEB_USER=' "${SITES_META_DIR}/${_sfdom}.conf" 2>/dev/null \
                                   | cut -d= -f2)
-    [[ -n "$_web_user" ]] && usermod -aG "$_web_user" "$_sfuser" 2>/dev/null || true
+
+    # Use web_user as primary group so file access works without supplementary-group issues
+    if [[ -n "$_web_user" ]]; then
+        useradd -M -d "$_sfsite" -s /sbin/nologin -g "$_web_user" "$_sfuser" 2>/dev/null \
+            || { log_error "Failed to create system user."; press_enter; return 1; }
+    else
+        useradd -M -d "$_sfsite" -s /sbin/nologin "$_sfuser" 2>/dev/null \
+            || { log_error "Failed to create system user."; press_enter; return 1; }
+    fi
+
+    echo "${_sfuser}:${_sfpass}" | chpasswd
 
     # Ensure Subsystem sftp uses internal-sftp (required for ChrootDirectory + ForceCommand)
     local _sshd="/etc/ssh/sshd_config"
