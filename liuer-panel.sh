@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.32"
+readonly VERSION="2.5.33"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -4520,13 +4520,10 @@ show_pma_url() {
     echo ""
     echo -e "  ${BOLD}phpMyAdmin URL:${NC}"
     echo ""
-    # Plain line — easy to select & copy
-    echo "  ${_url}"
+    echo "${_url}"
     echo ""
-    # Also save to file for easy access
     echo "$_url" > "${CONFIG_DIR}/pma_url"
-    echo -e "  ${DIM}URL saved to: ${CONFIG_DIR}/pma_url${NC}"
-    echo -e "  ${DIM}Run: cat ${CONFIG_DIR}/pma_url${NC}"
+    echo -e "  ${DIM}Saved: cat ${CONFIG_DIR}/pma_url${NC}"
     echo ""
     press_enter
 }
