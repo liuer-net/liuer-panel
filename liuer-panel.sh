@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.39"
+readonly VERSION="2.5.40"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -797,9 +797,6 @@ server {
     }
 
     location / { try_files \$uri \$uri/ =404; }
-
-    gzip on;
-    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
 
     location ~ /\.(?!well-known) { deny all; }
 $(_nginx_common_headers)
@@ -2043,6 +2040,52 @@ toggle_php_hardening() {
 
     local svc; svc=$(get_php_service "$_php_ver")
     systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+    press_enter
+}
+
+toggle_gzip() {
+    print_section "GZIP COMPRESSION"
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
+
+    local _cur="disabled"
+    grep -q '^\s*gzip on' "$_conf" && _cur="enabled"
+
+    echo -e "\n  Site : ${BOLD}${domain}${NC}"
+    echo -e "  Gzip : ${GREEN}${_cur}${NC}\n"
+    echo "  1) Enable"
+    echo "  2) Disable"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+
+    case "$_ch" in
+        1)
+            [[ "$_cur" == "enabled" ]] && { log_warn "Gzip already enabled."; press_enter; return; }
+            local _tmpf; _tmpf=$(mktemp)
+            awk '/location ~ \/\\./{
+                if (!ins) {
+                    print "    gzip on;"
+                    print "    gzip_vary on;"
+                    print "    gzip_proxied any;"
+                    print "    gzip_comp_level 6;"
+                    print "    gzip_types text/plain text/css text/xml application/json application/javascript application/xml+rss application/atom+xml image/svg+xml;"
+                    print ""
+                    ins=1
+                }
+            } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            log_success "Gzip enabled for ${domain}." ;;
+        2)
+            [[ "$_cur" == "disabled" ]] && { log_warn "Gzip already disabled."; press_enter; return; }
+            sed -i '/^\s*gzip/d' "$_conf"
+            log_success "Gzip disabled for ${domain}." ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
     press_enter
 }
 
@@ -4495,6 +4538,7 @@ menu_website() {
         echo "  11  Upload & timeout settings"
         echo "  12  SSL management"
         echo "  13  PHP URL routing"
+        echo "  14  Gzip compression"
         _sub_footer; read -r _ch
         case "$_ch" in
             1)  create_website ;;
@@ -4510,6 +4554,7 @@ menu_website() {
             11) manage_upload_settings ;;
             12) manage_site_ssl ;;
             13) toggle_php_routing ;;
+            14) toggle_gzip ;;
             0)  return ;;
             *)  log_warn "Invalid selection." ;;
         esac
