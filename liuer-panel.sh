@@ -1,0 +1,4516 @@
+#!/usr/bin/env bash
+# =============================================================================
+# LIUER PANEL - CLI Web Server Management Tool
+# Command : liuer
+# Supports: AlmaLinux 8/9/10 | Ubuntu 20.04 / 22.04 / 24.04
+# Usage   : bash liuer-panel.sh --install   (first time setup)
+#           liuer                            (management menu)
+#           liuer update / check-update / version
+# =============================================================================
+
+set -uo pipefail
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+readonly VERSION="2.5.17"
+readonly SCRIPT_NAME="liuer-panel.sh"
+readonly INSTALL_DIR="/opt/liuer-panel"
+readonly BIN_LINK="/usr/local/bin/liuer"
+readonly CONFIG_DIR="/etc/liuer-panel"
+readonly DB_LIST_FILE="${CONFIG_DIR}/db_list.txt"
+readonly SECRET_KEY_FILE="${CONFIG_DIR}/secret.key"
+readonly SITES_META_DIR="${CONFIG_DIR}/sites"
+readonly BACKUP_BASE="/home/backup"
+readonly NGINX_CONF_DIR="/etc/nginx/conf.d"
+readonly WWW_DIR="/home/web"
+readonly LOG_FILE="/var/log/liuer-panel.log"
+readonly REPO_URL="https://github.com/liuer-net/liuer-panel"
+readonly WEB_USERS_FILE="${CONFIG_DIR}/web_users.txt"
+readonly DANGEROUS_FUNCTIONS="exec,shell_exec,system,passthru,popen,proc_open,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,dl,putenv,show_source,highlight_file"
+
+# =============================================================================
+# PATH HELPERS  (user-based directory layout: /home/<user>/<domain>)
+# =============================================================================
+get_site_dir() {
+    local _dom="$1"
+    local _usr
+    _usr=$(grep "^WEB_USER=" "${SITES_META_DIR}/${_dom}.conf" 2>/dev/null | cut -d= -f2)
+    [[ -n "$_usr" ]] && echo "/home/web/${_usr}/${_dom}" || echo "/var/www/${_dom}"
+}
+
+get_backup_dir() {
+    local _dom="$1"
+    local _usr
+    _usr=$(grep "^WEB_USER=" "${SITES_META_DIR}/${_dom}.conf" 2>/dev/null | cut -d= -f2)
+    [[ -n "$_usr" ]] && echo "/home/backup/${_usr}/${_dom}" || echo "/backup/${_dom}"
+}
+
+# MySQL connection cache (session-scoped)
+MYSQL_CONNECT_METHOD=""
+MYSQL_ROOT_PASS=""
+
+# Temp vars for select_* functions
+SELECTED_PHP_VERSION=""
+SELECTED_SERVICE=""
+SELECTED_WEB_USER=""
+
+# =============================================================================
+# COLORS
+# =============================================================================
+if [[ -t 1 ]]; then
+    RED=$'\033[0;31m'   GREEN=$'\033[0;32m'  YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'  CYAN=$'\033[0;36m'   MAGENTA=$'\033[0;35m'
+    BOLD=$'\033[1m'     DIM=$'\033[2m'        NC=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' NC=''
+fi
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+log_info()    { echo -e "${GREEN}[INFO]${NC}  $*"; echo "[INFO]  $*" >> "$LOG_FILE" 2>/dev/null || true; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; echo "[WARN]  $*" >> "$LOG_FILE" 2>/dev/null || true; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; echo "[ERROR] $*" >> "$LOG_FILE" 2>/dev/null || true; }
+log_success() { echo -e "${GREEN}[OK]${NC}    $*"; echo "[OK]    $*" >> "$LOG_FILE" 2>/dev/null || true; }
+log_debug()   { [[ "${DEBUG:-0}" == "1" ]] && echo -e "${DIM}[DEBUG]${NC} $*" >&2 || true; }
+
+# =============================================================================
+# UI HELPERS
+# =============================================================================
+print_header() {
+    clear
+    local hn; hn=$(hostname -s 2>/dev/null || echo "server")
+    local title="L I U E R   P A N E L"
+    local inner=54
+    local lpad=$(( (inner - ${#title}) / 2 ))
+    local rpad=$(( inner - ${#title} - lpad ))
+    echo ""
+    echo -e "${CYAN}${BOLD}  ╔══════════════════════════════════════════════════════╗"
+    printf "${CYAN}${BOLD}  ║%${lpad}s%s%${rpad}s║${NC}\n" "" "$title" ""
+    echo -e "${CYAN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "    ${BOLD}v${VERSION}${NC}${DIM}  ·  ${hn}  ·  ${OS_ID} ${OS_VERSION_ID}${NC}"
+    echo ""
+}
+
+print_section() {
+    echo -e "\n${BOLD}▶ $1${NC}"
+    separator
+}
+
+separator() { echo -e "${DIM}──────────────────────────────────────────────────────${NC}"; }
+
+print_warning_box() {
+    echo -e "\n${RED}${BOLD}╔══════════════════════════════════════════════════════╗"
+    echo -e "║       ⚠   WARNING — THIS ACTION IS IRREVERSIBLE   ⚠   ║"
+    echo -e "╚══════════════════════════════════════════════════════╝${NC}"
+}
+
+press_enter() { echo ""; read -rp "  Press Enter to continue..."; }
+
+# =============================================================================
+# ROOT CHECK
+# =============================================================================
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script requires root privileges. Run: sudo liuer"
+        exit 1
+    fi
+}
+
+# =============================================================================
+# OS DETECTION
+# =============================================================================
+OS_FAMILY=""
+OS_ID=""
+OS_VERSION_ID=""
+
+detect_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        log_error "Cannot detect OS: /etc/os-release not found."
+        exit 1
+    fi
+
+    OS_ID=$(grep -oP '(?<=^ID=)[^\n]+' /etc/os-release | tr -d '"')
+    OS_VERSION_ID=$(grep -oP '(?<=^VERSION_ID=)[^\n]+' /etc/os-release | tr -d '"' | cut -d. -f1)
+
+    case "$OS_ID" in
+        almalinux|centos|rhel|rocky)
+            OS_FAMILY="rhel" ;;
+        ubuntu|debian)
+            OS_FAMILY="debian" ;;
+        *)
+            log_error "Unsupported OS: $OS_ID"
+            exit 1 ;;
+    esac
+
+    log_debug "OS: $OS_ID $OS_VERSION_ID ($OS_FAMILY)"
+}
+
+# =============================================================================
+# PACKAGE MANAGEMENT
+# =============================================================================
+pkg_install() {
+    case "$OS_FAMILY" in
+        rhel)   dnf install -y "$@" ;;
+        debian) DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    esac
+}
+
+pkg_remove() {
+    case "$OS_FAMILY" in
+        rhel)   dnf remove -y "$@" ;;
+        debian) DEBIAN_FRONTEND=noninteractive apt-get remove -y "$@" && apt-get autoremove -y ;;
+    esac
+}
+
+pkg_update_all() {
+    case "$OS_FAMILY" in
+        rhel)   dnf update -y ;;
+        debian) apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y ;;
+    esac
+}
+
+pkg_update_single() {
+    case "$OS_FAMILY" in
+        rhel)   dnf update -y "$@" ;;
+        debian) DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "$@" ;;
+    esac
+}
+
+setup_nginx_repo() {
+    case "$OS_FAMILY" in
+        rhel)
+            if [[ ! -f /etc/yum.repos.d/nginx.repo ]]; then
+                cat > /etc/yum.repos.d/nginx.repo <<'EOF'
+[nginx-mainline]
+name=nginx mainline repo
+baseurl=http://nginx.org/packages/mainline/rhel/$releasever/$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=https://nginx.org/keys/nginx_signing.key
+module_hotfixes=true
+EOF
+                rpm --import https://nginx.org/keys/nginx_signing.key 2>/dev/null || true
+            fi
+            ;;
+        debian)
+            if [[ ! -f /etc/apt/sources.list.d/nginx.list ]]; then
+                curl -fsSL https://nginx.org/keys/nginx_signing.key \
+                    | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg 2>/dev/null
+                local _codename; _codename=$(lsb_release -cs 2>/dev/null || echo "noble")
+                echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
+http://nginx.org/packages/mainline/ubuntu ${_codename} nginx" \
+                    > /etc/apt/sources.list.d/nginx.list
+                apt-get update -y 2>/dev/null || true
+            fi
+            ;;
+    esac
+}
+
+upgrade_nginx_mainline() {
+    local _cur_ver; _cur_ver=$(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1)
+    local _maj; _maj=$(echo "$_cur_ver" | cut -d. -f1)
+    local _min; _min=$(echo "$_cur_ver" | cut -d. -f2)
+    if [[ "$_maj" -gt 1 ]] || [[ "$_maj" -eq 1 && "$_min" -ge 25 ]]; then
+        log_info "Nginx ${_cur_ver} already ≥ 1.25 — skipped."
+        return 0
+    fi
+    log_info "Nginx ${_cur_ver} < 1.25 — upgrading to mainline..."
+    setup_nginx_repo
+    case "$OS_FAMILY" in
+        rhel)
+            # Disable distro nginx module if active, then install from nginx.org
+            dnf module disable nginx -y 2>/dev/null || true
+            dnf install -y nginx --disablerepo='*' --enablerepo='nginx-mainline' 2>/dev/null \
+                || dnf update -y nginx
+            ;;
+        debian)
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades nginx
+            ;;
+    esac
+    nginx -t &>/dev/null && systemctl reload nginx || systemctl restart nginx
+    log_success "Nginx upgraded to $(nginx -v 2>&1 | grep -oP '[\d.]+'| head -1)"
+}
+
+# =============================================================================
+# PHP CROSS-DISTRO HELPERS
+# =============================================================================
+
+# Returns a space-separated list of installed PHP versions (e.g. "7.4 8.1 8.2")
+get_php_versions() {
+    local versions=()
+    case "$OS_FAMILY" in
+        rhel)
+            # Remi repo: php74-php-fpm, php81-php-fpm, php82-php-fpm ...
+            while IFS= read -r unit; do
+                local ver
+                ver=$(echo "$unit" | grep -oP 'php\K\d+(?=-php-fpm)')
+                [[ -n "$ver" ]] && versions+=("${ver:0:1}.${ver:1}")
+            done < <(systemctl list-units --type=service --state=loaded --no-legend 2>/dev/null \
+                      | grep -oP 'php\d+-php-fpm(?=\.service)' || true)
+            ;;
+        debian)
+            while IFS= read -r unit; do
+                local ver
+                ver=$(echo "$unit" | grep -oP '\d+\.\d+(?=-fpm\.service)')
+                [[ -n "$ver" ]] && versions+=("$ver")
+            done < <(systemctl list-units --type=service --state=loaded --no-legend 2>/dev/null \
+                      | grep -oP 'php[\d.]+-fpm\.service' || true)
+            ;;
+    esac
+    echo "${versions[*]:-}"
+}
+
+get_php_socket() {
+    local ver="$1"   # e.g. "8.1"
+    case "$OS_FAMILY" in
+        rhel)
+            local vn="${ver//./}"   # "81"
+            echo "/var/opt/remi/php${vn}/run/php-fpm/www.sock"
+            ;;
+        debian)
+            echo "/run/php/php${ver}-fpm.sock"
+            ;;
+    esac
+}
+
+get_php_pool_socket() {
+    local ver="$1" domain="$2"
+    local vn="${ver//./}"
+    case "$OS_FAMILY" in
+        rhel)   echo "/var/opt/remi/php${vn}/run/php-fpm/${domain}.sock" ;;
+        debian) echo "/run/php/php${ver}-fpm-${domain}.sock" ;;
+    esac
+}
+
+get_php_pool_conf() {
+    local ver="$1" domain="$2"
+    local vn="${ver//./}"
+    case "$OS_FAMILY" in
+        rhel)   echo "/etc/opt/remi/php${vn}/php-fpm.d/${domain}.conf" ;;
+        debian) echo "/etc/php/${ver}/fpm/pool.d/${domain}.conf" ;;
+    esac
+}
+
+create_php_pool() {
+    local ver="$1" domain="$2" site_user="$3" disable_funcs="${4:-1}" site_path="${5:-}"
+    [[ -z "$site_path" ]] && site_path="/home/web/${site_user}/${domain}"
+    local pool_conf; pool_conf=$(get_php_pool_conf "$ver" "$domain")
+    local socket; socket=$(get_php_pool_socket "$ver" "$domain")
+    local nginx_user="nginx"
+    id nginx &>/dev/null || nginx_user="www-data"
+    cat > "$pool_conf" <<EOF
+[${domain}]
+user = ${site_user}
+group = ${site_user}
+listen = ${socket}
+listen.owner = ${nginx_user}
+listen.group = ${nginx_user}
+listen.mode = 0660
+pm = dynamic
+pm.max_children = 5
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+php_admin_value[error_log] = /var/log/nginx/${domain}_php_error.log
+php_admin_flag[log_errors] = on
+php_admin_value[open_basedir] = ${site_path}:/tmp:/var/tmp
+EOF
+    if [[ "$disable_funcs" == "1" ]]; then
+        echo "php_admin_value[disable_functions] = ${DANGEROUS_FUNCTIONS}" >> "$pool_conf"
+    fi
+    local svc; svc=$(get_php_service "$ver")
+    systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+}
+
+# Set or update a single key in a PHP-FPM pool conf file
+_php_pool_set() {
+    local pool_conf="$1" key="$2" val="$3"
+    if grep -q "^${key} = " "$pool_conf" 2>/dev/null; then
+        sed -i "s|^${key} = .*|${key} = ${val}|" "$pool_conf"
+    else
+        echo "${key} = ${val}" >> "$pool_conf"
+    fi
+}
+
+_disable_default_fpm_pools() {
+    local vers_str; vers_str=$(get_php_versions)
+    [[ -z "$vers_str" ]] && return 0
+    local -a vers; read -ra vers <<< "$vers_str"
+    for ver in "${vers[@]}"; do
+        local pool_conf
+        case "$OS_FAMILY" in
+            rhel)
+                local vn="${ver//./}"
+                pool_conf="/etc/opt/remi/php${vn}/php-fpm.d/www.conf"
+                ;;
+            debian)
+                pool_conf="/etc/php/${ver}/fpm/pool.d/www.conf"
+                ;;
+        esac
+        if [[ -f "$pool_conf" ]]; then
+            mv "$pool_conf" "${pool_conf}.disabled"
+            local svc; svc=$(get_php_service "$ver")
+            systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+            log_success "Disabled default PHP-FPM pool: PHP ${ver}"
+        fi
+    done
+}
+
+_set_site_perms() {
+    local site_dir="$1" site_user="$2"
+    local nginx_user="nginx"
+    id nginx &>/dev/null || nginx_user="www-data"
+    # Parent /home/web/<user>/ — root:root 755 so nginx can traverse
+    local _parent; _parent="$(dirname "$site_dir")"
+    if [[ "$_parent" == /home/web/* ]]; then
+        chown root:root "$_parent" 2>/dev/null || true
+        chmod 755 "$_parent"
+    fi
+    chown -R "${site_user}:${site_user}" "$site_dir"
+    find "$site_dir" -type d -exec chmod 750 {} \;
+    find "$site_dir" -type f -exec chmod 640 {} \;
+    usermod -aG "$site_user" "$nginx_user" 2>/dev/null || true
+}
+
+remove_php_pool() {
+    local ver="$1" domain="$2"
+    local pool_conf; pool_conf=$(get_php_pool_conf "$ver" "$domain")
+    rm -f "$pool_conf"
+    local svc; svc=$(get_php_service "$ver")
+    systemctl reload "$svc" 2>/dev/null || true
+}
+
+# Fix PHP-FPM pool socket permissions so nginx can connect
+_fix_fpm_socket_perms() {
+    local ver="$1"
+    [[ "$OS_FAMILY" != "rhel" ]] && return 0
+    local vn="${ver//./}"
+    local pool_conf="/etc/opt/remi/php${vn}/php-fpm.d/www.conf"
+    [[ ! -f "$pool_conf" ]] && return 0
+
+    local web_user="nginx"
+    id nginx &>/dev/null || web_user="www-data"
+
+    # Pool process user/group — must match web server user so it can read site files
+    sed -i "s/^user\s*=.*/user = ${web_user}/"   "$pool_conf"
+    sed -i "s/^group\s*=.*/group = ${web_user}/" "$pool_conf"
+
+    sed -i "s/^;*listen\.owner\s*=.*/listen.owner = ${web_user}/" "$pool_conf"
+    sed -i "s/^;*listen\.group\s*=.*/listen.group = ${web_user}/" "$pool_conf"
+    sed -i "s/^;*listen\.mode\s*=.*/listen.mode = 0660/"          "$pool_conf"
+    # acl_users overrides owner/group — add web_user to the list
+    sed -i "s/^listen\.acl_users\s*=.*/listen.acl_users = apache,${web_user}/" "$pool_conf"
+
+    # Add if lines don't exist
+    grep -q "^listen\.owner" "$pool_conf" || echo "listen.owner = ${web_user}" >> "$pool_conf"
+    grep -q "^listen\.group" "$pool_conf" || echo "listen.group = ${web_user}" >> "$pool_conf"
+    grep -q "^listen\.mode"  "$pool_conf" || echo "listen.mode = 0660"         >> "$pool_conf"
+
+    # Fix session/cache dir ownership so PHP-FPM (running as web_user) can write
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        local vn="${ver//./}"
+        local php_lib="/var/opt/remi/php${vn}/lib/php"
+        for d in session wsdlcache opcache; do
+            [[ -d "${php_lib}/${d}" ]] && chown -R "${web_user}:${web_user}" "${php_lib}/${d}" 2>/dev/null || true
+        done
+    fi
+
+    local svc; svc=$(get_php_service "$ver")
+    systemctl restart "$svc" 2>/dev/null || true
+}
+
+get_php_service() {
+    local ver="$1"
+    case "$OS_FAMILY" in
+        rhel)
+            local vn="${ver//./}"
+            echo "php${vn}-php-fpm"
+            ;;
+        debian)
+            echo "php${ver}-fpm"
+            ;;
+    esac
+}
+
+# Returns the package list needed to install a given PHP version
+get_php_packages() {
+    local ver="$1"
+    case "$OS_FAMILY" in
+        rhel)
+            local vn="${ver//./}"
+            echo "php${vn}-php-fpm php${vn}-php-cli php${vn}-php-common \
+                  php${vn}-php-mysqlnd php${vn}-php-mbstring php${vn}-php-xml \
+                  php${vn}-php-gd php${vn}-php-curl php${vn}-php-zip \
+                  php${vn}-php-bcmath php${vn}-php-opcache php${vn}-php-intl \
+                  php${vn}-php-pdo php${vn}-php-soap"
+            ;;
+        debian)
+            echo "php${ver}-fpm php${ver}-cli php${ver}-common \
+                  php${ver}-mysql php${ver}-mbstring php${ver}-xml \
+                  php${ver}-gd php${ver}-curl php${ver}-zip \
+                  php${ver}-bcmath php${ver}-opcache php${ver}-intl"
+            ;;
+    esac
+}
+
+# =============================================================================
+# FIREWALL DETECTION
+# =============================================================================
+detect_firewall() {
+    if command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null; then
+        echo "firewalld"
+    elif command -v ufw &>/dev/null; then
+        echo "ufw"
+    else
+        echo "none"
+    fi
+}
+
+_open_http_https() {
+    local fw; fw=$(detect_firewall)
+    case "$fw" in
+        firewalld)
+            firewall-cmd --permanent --add-service=http  &>/dev/null || true
+            firewall-cmd --permanent --add-service=https &>/dev/null || true
+            firewall-cmd --reload &>/dev/null || true
+            log_info "Firewall: HTTP/HTTPS services opened (firewalld)."
+            ;;
+        ufw)
+            ufw allow http  &>/dev/null || true
+            ufw allow https &>/dev/null || true
+            log_info "Firewall: HTTP/HTTPS opened (ufw)."
+            ;;
+        none)
+            log_warn "No active firewall detected — skipping firewall rule."
+            ;;
+    esac
+}
+
+# =============================================================================
+# SECURITY: ENCRYPT / DECRYPT
+# =============================================================================
+ensure_secret_key() {
+    if [[ ! -f "$SECRET_KEY_FILE" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        openssl rand -base64 32 > "$SECRET_KEY_FILE"
+        chmod 600 "$SECRET_KEY_FILE"
+        log_info "Secret key created: $SECRET_KEY_FILE"
+    fi
+}
+
+encrypt_pass() {
+    local plaintext="$1"
+    local key
+    key=$(cat "$SECRET_KEY_FILE")
+    printf '%s' "$plaintext" | openssl enc -aes-256-cbc -a -salt -md md5 -pass "pass:${key}" 2>/dev/null
+}
+
+decrypt_pass() {
+    local cipher="$1"
+    [[ -z "$cipher" ]] && return 1
+    local key
+    key=$(cat "$SECRET_KEY_FILE" 2>/dev/null)
+    [[ -z "$key" ]] && return 1
+    local result
+    result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -md md5 -pass "pass:${key}" 2>/dev/null)
+    [[ -z "$result" ]] && \
+    result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -pass "pass:${key}" 2>/dev/null)
+    [[ -z "$result" ]] && \
+    result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -pbkdf2 -pass "pass:${key}" 2>/dev/null)
+    [[ -z "$result" ]] && return 1
+    printf '%s' "$result"
+}
+
+# =============================================================================
+# SECURITY: MYSQL CONNECTION (fallback chain + session cache)
+# =============================================================================
+mysql_exec() {
+    local query="$1"
+
+    # Use cached method from this session
+    if [[ -n "$MYSQL_CONNECT_METHOD" ]]; then
+        case "$MYSQL_CONNECT_METHOD" in
+            nopass) mysql -u root -e "$query" 2>/dev/null; return $? ;;
+            mycnf)  mysql --defaults-file=/root/.my.cnf -e "$query" 2>/dev/null; return $? ;;
+            pass)   mysql -u root -p"${MYSQL_ROOT_PASS}" -e "$query" 2>/dev/null; return $? ;;
+        esac
+    fi
+
+    # Try without password
+    if mysql -u root -e "$query" &>/dev/null; then
+        MYSQL_CONNECT_METHOD="nopass"; return 0
+    fi
+
+    # Try /root/.my.cnf
+    if [[ -f /root/.my.cnf ]] && mysql --defaults-file=/root/.my.cnf -e "$query" &>/dev/null; then
+        MYSQL_CONNECT_METHOD="mycnf"; return 0
+    fi
+
+    # Ask for password
+    echo -e "${YELLOW}Enter MySQL root password:${NC}"
+    read -rs MYSQL_ROOT_PASS
+    echo ""
+    if mysql -u root -p"${MYSQL_ROOT_PASS}" -e "$query" &>/dev/null; then
+        MYSQL_CONNECT_METHOD="pass"; return 0
+    fi
+
+    log_error "Cannot connect to MySQL. Check your credentials."
+    return 1
+}
+
+# =============================================================================
+# INPUT VALIDATION & PROMPT HELPERS
+# =============================================================================
+validate_domain() {
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]
+}
+
+validate_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+}
+
+# Simple [y/N] confirmation
+confirm_action() {
+    local prompt="${1:-Are you sure?}"
+    local _ans
+    echo -e "${YELLOW}${prompt} [y/N]:${NC} \c"
+    read -r _ans
+    [[ "$_ans" =~ ^[Yy]$ ]]
+}
+
+# Strong confirmation: user must type "CONFIRM" exactly
+confirm_danger() {
+    local action="$1"
+    local _confirm
+    print_warning_box
+    echo -e "${RED}Action: ${BOLD}${action}${NC}"
+    echo -e "${YELLOW}To proceed, type exactly:  ${BOLD}CONFIRM${NC}"
+    echo -e "Anything else to cancel: \c"
+    read -r _confirm
+    [[ "$_confirm" == "CONFIRM" ]]
+}
+
+prompt_default() {
+    local prompt="$1" default="$2" _input
+    echo -e "${BOLD}${prompt}${NC} [${default}]: \c"
+    read -r _input
+    echo "${_input:-$default}"
+}
+
+rand_str() {
+    local len="${1:-16}"
+    tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$len" || true
+}
+
+# =============================================================================
+# NGINX CONFIG TEMPLATES
+# =============================================================================
+_nginx_common_headers() {
+    cat <<'EOF'
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+EOF
+}
+
+nginx_tpl_php() {
+    local domain="$1" root="$2" socket="$3"
+    cat <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain} www.${domain};
+    root ${root};
+    index index.php index.html;
+
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log  /var/log/nginx/${domain}_error.log warn;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/http_challenges;
+        default_type text/plain;
+        allow all;
+    }
+
+    location / { try_files \$uri \$uri/ =404; }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:${socket};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ /\.(?!well-known) { deny all; }
+$(_nginx_common_headers)
+}
+EOF
+}
+
+nginx_tpl_laravel() {
+    local domain="$1" root="$2" socket="$3"
+    cat <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain} www.${domain};
+    root ${root};
+    index index.php;
+
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log  /var/log/nginx/${domain}_error.log warn;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/http_challenges;
+        default_type text/plain;
+        allow all;
+    }
+
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:${socket};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_hide_header X-Powered-By;
+    }
+
+    location ~ /\.(?!well-known) { deny all; }
+$(_nginx_common_headers)
+}
+EOF
+}
+
+nginx_tpl_wordpress() {
+    local domain="$1" root="$2" socket="$3"
+    cat <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain} www.${domain};
+    root ${root};
+    index index.php;
+
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log  /var/log/nginx/${domain}_error.log warn;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/http_challenges;
+        default_type text/plain;
+        allow all;
+    }
+
+    location / { try_files \$uri \$uri/ /index.php?\$args; }
+
+    location ~ \.php$ {
+        fastcgi_pass unix:${socket};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    # WordPress security rules
+    location ~* /(?:uploads|files)/.*\.php$  { deny all; }
+    location ~* /(?:xmlrpc|wp-trackback)\.php { deny all; }
+    location ~ /\.(?!well-known)              { deny all; }
+$(_nginx_common_headers)
+}
+EOF
+}
+
+nginx_tpl_static() {
+    local domain="$1" root="$2"
+    cat <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain} www.${domain};
+    root ${root};
+    index index.html index.htm;
+
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log  /var/log/nginx/${domain}_error.log warn;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/http_challenges;
+        default_type text/plain;
+        allow all;
+    }
+
+    location / { try_files \$uri \$uri/ =404; }
+
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
+
+    location ~ /\.(?!well-known) { deny all; }
+$(_nginx_common_headers)
+}
+EOF
+}
+
+# =============================================================================
+# WEBSITE MODULE
+# =============================================================================
+
+# Interactively select a PHP version → SELECTED_PHP_VERSION
+select_php_version() {
+    local vers_str
+    vers_str=$(get_php_versions)
+    if [[ -z "$vers_str" ]]; then
+        log_error "No PHP-FPM version found. Install PHP first."
+        return 1
+    fi
+
+    local -a php_versions
+    read -ra php_versions <<< "$vers_str"
+
+    echo -e "\n${BOLD}Installed PHP versions:${NC}"
+    local i=1
+    for v in "${php_versions[@]}"; do
+        echo "  $i) PHP $v"
+        ((i++)) || true
+    done
+    echo "  0) Cancel"
+
+    local choice
+    while true; do
+        echo -e "${YELLOW}Select [0-${#php_versions[@]}]:${NC} \c"
+        read -r choice
+        [[ "$choice" == "0" ]] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] \
+           && [[ "$choice" -ge 1 ]] \
+           && [[ "$choice" -le ${#php_versions[@]} ]]; then
+            SELECTED_PHP_VERSION="${php_versions[$((choice-1))]}"
+            return 0
+        fi
+        log_warn "Invalid selection."
+    done
+}
+
+# =============================================================================
+# WEB USER MANAGEMENT
+# =============================================================================
+_select_web_user() {
+    local prompt="${1:-Select web user}"
+    [[ ! -f "$WEB_USERS_FILE" ]] && { log_warn "No web users found. Create one first."; return 1; }
+    local -a _users=()
+    while IFS='|' read -r _u _; do
+        [[ -n "$_u" ]] && _users+=("$_u")
+    done < "$WEB_USERS_FILE"
+    [[ ${#_users[@]} -eq 0 ]] && { log_warn "No web users found."; return 1; }
+    echo ""
+    local i=1
+    for u in "${_users[@]}"; do
+        printf "  %2d) %s\n" "$i" "$u"
+        ((i++)) || true
+    done
+    echo "   0) Cancel"
+    echo -ne "\n  ${prompt} [1-$((i-1))]: "
+    read -r _sel
+    [[ "$_sel" == "0" || -z "$_sel" ]] && return 1
+    if [[ ! "$_sel" =~ ^[0-9]+$ ]] || [[ "$_sel" -lt 1 ]] || [[ "$_sel" -gt ${#_users[@]} ]]; then
+        log_warn "Invalid selection."; return 1
+    fi
+    SELECTED_WEB_USER="${_users[$((${_sel}-1))]}"
+}
+
+_save_web_user() {
+    local _username="$1" _password="$2" _login="${3:-0}"
+    local _shell="/usr/sbin/nologin"
+    [[ "$_login" == "1" ]] && _shell="/bin/bash"
+    useradd --system --no-create-home --shell "$_shell" "$_username" \
+        || { log_error "Failed to create system user '$_username'."; return 1; }
+    echo "${_username}:${_password}" | chpasswd 2>/dev/null || true
+    mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+    touch "$WEB_USERS_FILE" && chmod 600 "$WEB_USERS_FILE"
+    sed -i "/^${_username}|/d" "$WEB_USERS_FILE" 2>/dev/null || true
+    local _enc; _enc=$(encrypt_pass "$_password")
+    echo "${_username}|${_enc}|${_login}" >> "$WEB_USERS_FILE"
+    SELECTED_WEB_USER="$_username"
+}
+
+_auto_create_web_user() {
+    local _username="web$(rand_str 8)"
+    local _password; _password=$(rand_str 20)
+    _save_web_user "$_username" "$_password" "0" || return 1
+    log_success "Web user created: ${_username}"
+}
+
+_create_web_user_interactive() {
+    echo -e "\n${BOLD}Create web user:${NC}"
+    echo "  1) Auto-generate username & password"
+    echo "  2) Enter manually"
+    echo "  0) Cancel"
+    local _copt
+    echo -e "${YELLOW}Select [0-2]:${NC} \c"; read -r _copt
+    local _username _password
+    case "$_copt" in
+        0) log_info "Cancelled."; return 1 ;;
+        1) _auto_create_web_user; return ;;
+        2)
+            echo -ne "  Username: "; read -r _username
+            echo -ne "  Password: "; read -r _password
+            [[ -z "$_username" || -z "$_password" ]] && { log_error "Username and password required."; return 1; }
+            ;;
+        *) log_warn "Invalid selection."; return 1 ;;
+    esac
+    if ! [[ "$_username" =~ ^[a-z][a-z0-9_]{2,31}$ ]]; then
+        log_error "Invalid username (lowercase, 3-32 chars, start with letter)."; return 1
+    fi
+    if id "$_username" &>/dev/null; then
+        log_error "User '$_username' already exists."; return 1
+    fi
+    local _login="0"
+    echo -ne "  Allow login (SSH)? [y/N]: "; read -r _lopt
+    [[ "$_lopt" =~ ^[Yy]$ ]] && _login="1"
+    _save_web_user "$_username" "$_password" "$_login" || return 1
+    log_success "Web user created: ${_username}"
+    printf "  %-12s: %s\n" "Username" "$_username"
+    printf "  %-12s: %s\n" "Password" "$_password"
+    printf "  %-12s: %s\n" "Login" "$([[ "$_login" == "1" ]] && echo "Allowed" || echo "Disabled")"
+}
+
+list_web_users() {
+    print_section "WEB USER LIST"
+    if [[ ! -f "$WEB_USERS_FILE" ]] || [[ ! -s "$WEB_USERS_FILE" ]]; then
+        log_warn "No web users found."; press_enter; return
+    fi
+    echo ""
+    printf "  %-18s %-22s %-8s %s\n" "Username" "Password" "Login" "Sites"
+    separator
+    while IFS='|' read -r _u _enc _login; do
+        [[ -z "$_u" ]] && continue
+        local _pass; _pass=$(decrypt_pass "$_enc" 2>/dev/null) || _pass="[decrypt error]"
+        [[ -z "$_pass" ]] && _pass="[decrypt error]"
+        _login="${_login:-0}"
+        local _login_str
+        [[ "$_login" == "1" ]] && _login_str="${GREEN}Yes${NC}" || _login_str="${DIM}No${NC}"
+        local _sites=""
+        for _mf in "${SITES_META_DIR}"/*.conf; do
+            [[ -f "$_mf" ]] || continue
+            grep -q "^WEB_USER=${_u}$" "$_mf" 2>/dev/null \
+                && _sites+="$(basename "$_mf" .conf) "
+        done
+        printf "  %-18s %-22s " "$_u" "$_pass"
+        printf "%b%-4s%b %s\n" "" "$_login_str" "" "${_sites:-—}"
+    done < "$WEB_USERS_FILE"
+    separator
+    press_enter
+}
+
+_delete_web_user() {
+    _select_web_user "Select user to delete" || { press_enter; return; }
+    local _du="$SELECTED_WEB_USER"
+    local _sites=""
+    for _mf in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$_mf" ]] || continue
+        grep -q "^WEB_USER=${_du}$" "$_mf" 2>/dev/null \
+            && _sites+="$(basename "$_mf" .conf) "
+    done
+    if [[ -n "$_sites" ]]; then
+        log_warn "User '${_du}' is still used by: ${_sites}"
+        log_warn "Delete those sites first."; press_enter; return
+    fi
+    confirm_danger "Delete web user ${_du}" || { log_info "Cancelled."; return 0; }
+    userdel "$_du" 2>/dev/null || true
+    sed -i "/^${_du}|/d" "$WEB_USERS_FILE" 2>/dev/null || true
+    log_success "User '${_du}' deleted."
+    press_enter
+}
+
+change_web_user() {
+    print_section "CHANGE WEB USER"
+
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+
+    local _cur_user="" _php_ver=""
+    if [[ -f "$_meta" ]]; then
+        _cur_user=$(grep "^WEB_USER=" "$_meta" | cut -d= -f2)
+        _php_ver=$(grep "^PHP_VERSION=" "$_meta" | cut -d= -f2)
+    fi
+    local _site_dir; _site_dir="$(get_site_dir "$domain")"
+
+    echo -e "\n  Site      : ${BOLD}${domain}${NC}"
+    echo -e "  PHP       : ${_php_ver:-N/A}"
+    echo -e "  Current   : ${BOLD}${_cur_user:-nginx/www-data (default)}${NC}"
+    echo ""
+
+    echo "  1) Select existing web user"
+    echo "  2) Create new web user"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select [1-2]:${NC} \c"; read -r _ch
+    local _new_user=""
+    case "$_ch" in
+        1)
+            SELECTED_WEB_USER=""
+            _select_web_user "Select new user" || { press_enter; return; }
+            _new_user="$SELECTED_WEB_USER"
+            ;;
+        2)
+            _create_web_user_interactive || { press_enter; return; }
+            _new_user="$SELECTED_WEB_USER"
+            ;;
+        *) log_info "Cancelled."; return 0 ;;
+    esac
+
+    [[ "$_new_user" == "$_cur_user" ]] && { log_warn "Same user selected, nothing to do."; press_enter; return; }
+    [[ -z "$_new_user" ]] && { log_warn "No user selected."; press_enter; return; }
+
+    # Remove old pool if a per-site pool exists
+    if [[ -n "$_cur_user" && -n "$_php_ver" ]]; then
+        remove_php_pool "$_php_ver" "$domain" 2>/dev/null || true
+    fi
+
+    # Create new pool
+    if [[ -n "$_php_ver" ]]; then
+        create_php_pool "$_php_ver" "$domain" "$_new_user"
+        # Update nginx fastcgi_pass to new socket
+        local _new_sock; _new_sock=$(get_php_pool_socket "$_php_ver" "$domain")
+        local _nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+        if [[ -f "$_nginx_conf" ]]; then
+            sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:${_new_sock};|" "$_nginx_conf"
+            nginx -t &>/dev/null && nginx -s reload
+        fi
+    fi
+
+    # Move site directory to new user's home and fix permissions
+    local _new_site_dir="/home/web/${_new_user}/${domain}"
+    if [[ -d "$_site_dir" && "$_site_dir" != "$_new_site_dir" ]]; then
+        mkdir -p "/home/web/${_new_user}"
+        mv "$_site_dir" "$_new_site_dir"
+        log_success "Moved: ${_site_dir} → ${_new_site_dir}"
+        # Update nginx root paths
+        local _nc="${NGINX_CONF_DIR}/${domain}.conf"
+        [[ -f "$_nc" ]] && sed -i "s|${_site_dir}|${_new_site_dir}|g" "$_nc"
+        # Update PHP pool open_basedir
+        if [[ -n "$_php_ver" ]]; then
+            local _pool; _pool=$(get_php_pool_conf "$_php_ver" "$domain")
+            [[ -f "$_pool" ]] && sed -i "s|open_basedir = .*|open_basedir = ${_new_site_dir}:/tmp:/var/tmp|" "$_pool"
+        fi
+        # Update SFTP chroot in sshd_config
+        sed -i "s|ChrootDirectory ${_site_dir}|ChrootDirectory ${_new_site_dir}|g" /etc/ssh/sshd_config 2>/dev/null || true
+    fi
+    [[ -d "$_new_site_dir" ]] && _set_site_perms "$_new_site_dir" "$_new_user"
+
+    # Update metadata
+    if [[ -f "$_meta" ]]; then
+        sed -i "s/^WEB_USER=.*/WEB_USER=${_new_user}/" "$_meta"
+        sed -i "s|^SITE_DIR=.*|SITE_DIR=${_new_site_dir}|" "$_meta"
+    else
+        echo "WEB_USER=${_new_user}" >> "$_meta"
+    fi
+
+    log_success "Web user for ${domain} changed: ${_cur_user:-default} → ${_new_user}"
+    press_enter
+}
+
+migrate_site_users() {
+    print_section "MIGRATE SITES TO DEDICATED USERS"
+    local _count=0 _skipped=0
+    for _mf in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$_mf" ]] || continue
+        local _dom; _dom=$(basename "$_mf" .conf)
+        local _cur_user; _cur_user=$(grep "^WEB_USER=" "$_mf" 2>/dev/null | cut -d= -f2)
+        local _php_ver; _php_ver=$(grep "^PHP_VERSION=" "$_mf" 2>/dev/null | cut -d= -f2)
+
+        if [[ -n "$_cur_user" ]]; then
+            log_info "  ${_dom}: already has user '${_cur_user}' — skipped"
+            ((_skipped++)) || true
+            continue
+        fi
+
+        log_info "  ${_dom}: creating dedicated user..."
+        SELECTED_WEB_USER=""
+        if ! _auto_create_web_user; then
+            log_warn "  ${_dom}: failed to create user — skipped"
+            continue
+        fi
+        local _new_user="$SELECTED_WEB_USER"
+
+        # Create PHP-FPM pool if PHP version is known
+        if [[ -n "$_php_ver" ]]; then
+            create_php_pool "$_php_ver" "$_dom" "$_new_user"
+            # Update nginx fastcgi_pass socket
+            local _new_sock; _new_sock=$(get_php_pool_socket "$_php_ver" "$_dom")
+            local _nginx_conf="${NGINX_CONF_DIR}/${_dom}.conf"
+            [[ -f "$_nginx_conf" ]] && sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:${_new_sock};|" "$_nginx_conf"
+        fi
+
+        # Transfer file ownership (move /var/www/<dom> → /home/web/<user>/<dom> if needed)
+        local _site_dir; _site_dir="$(get_site_dir "$_dom")"
+        local _old_dir="/var/www/${_dom}"
+        if [[ -d "$_old_dir" && ! -d "$_site_dir" ]]; then
+            mkdir -p "/home/web/${_new_user}"
+            mv "$_old_dir" "$_site_dir"
+            local _nc="${NGINX_CONF_DIR}/${_dom}.conf"
+            [[ -f "$_nc" ]] && sed -i "s|${_old_dir}|${_site_dir}|g" "$_nc"
+        fi
+        [[ -d "$_site_dir" ]] && _set_site_perms "$_site_dir" "$_new_user"
+
+        # Save to metadata
+        echo "WEB_USER=${_new_user}" >> "$_mf"
+        log_success "  ${_dom}: → ${_new_user}"
+        ((_count++)) || true
+    done
+
+    [[ -n "$_php_ver" ]] && nginx -t &>/dev/null && nginx -s reload || true
+    echo ""
+    log_success "Migration done: ${_count} migrated, ${_skipped} already had users."
+    press_enter
+}
+
+toggle_web_user_login() {
+    _select_web_user "Select user" || { press_enter; return; }
+    local _tu="$SELECTED_WEB_USER"
+    local _cur_login
+    _cur_login=$(grep "^${_tu}|" "$WEB_USERS_FILE" | cut -d'|' -f3)
+    _cur_login="${_cur_login:-0}"
+
+    echo -e "\n  User  : ${BOLD}${_tu}${NC}"
+    if [[ "$_cur_login" == "1" ]]; then
+        echo -e "  Login : ${GREEN}Allowed${NC}"
+        echo ""
+        echo "  1) Disable login"
+        echo "  0) Cancel"
+        echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+        [[ "$_ch" != "1" ]] && return 0
+        usermod -s /usr/sbin/nologin "$_tu" 2>/dev/null || true
+        sed -i "s/^${_tu}|\(.*\)|[01]$/${_tu}|\1|0/" "$WEB_USERS_FILE"
+        log_success "Login disabled for ${_tu}."
+    else
+        echo -e "  Login : ${DIM}Disabled${NC}"
+        echo ""
+        echo "  1) Enable login (SSH)"
+        echo "  0) Cancel"
+        echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+        [[ "$_ch" != "1" ]] && return 0
+        usermod -s /bin/bash "$_tu" 2>/dev/null || true
+        sed -i "s/^${_tu}|\(.*\)|[01]$/${_tu}|\1|1/" "$WEB_USERS_FILE"
+        # Handle entries without 3rd field (legacy)
+        grep -q "^${_tu}|.*|[01]$" "$WEB_USERS_FILE" || \
+            sed -i "s/^${_tu}|\(.*\)$/${_tu}|\1|1/" "$WEB_USERS_FILE"
+        log_success "Login enabled for ${_tu}."
+    fi
+    press_enter
+}
+
+manage_web_users() {
+    while true; do
+        print_section "WEB USER MANAGEMENT"
+        echo "  1) List users & credentials"
+        echo "  2) Create new user"
+        echo "  3) Delete user"
+        echo "  4) Change site user"
+        echo "  5) Toggle login (enable/disable)"
+        echo "  6) Migrate existing sites"
+        echo "  0) Back"
+        echo -e "${YELLOW}Select:${NC} \c"; read -r _wopt
+        case "$_wopt" in
+            1) list_web_users ;;
+            2) _create_web_user_interactive; press_enter ;;
+            3) _delete_web_user ;;
+            4) change_web_user ;;
+            5) toggle_web_user_login ;;
+            6) migrate_site_users ;;
+            0) return ;;
+        esac
+    done
+}
+
+create_website() {
+    print_section "CREATE NEW WEBSITE"
+
+    # --- Domain ---
+    local domain
+    while true; do
+        echo -e "${BOLD}Enter domain (e.g. example.com) or 0 to cancel:${NC} \c"
+        read -r domain
+        [[ "$domain" == "0" || -z "$domain" ]] && { log_info "Cancelled."; return 0; }
+        if validate_domain "$domain"; then break; fi
+        log_warn "Invalid domain format, try again."
+    done
+
+    if [[ -f "${NGINX_CONF_DIR}/${domain}.conf" ]]; then
+        log_error "Domain '$domain' already exists."
+        press_enter; return 1
+    fi
+
+    # --- Site type ---
+    echo -e "\n${BOLD}Site type:${NC}"
+    echo "  1) PHP (plain)"
+    echo "  2) Laravel"
+    echo "  3) WordPress"
+    echo "  4) Static (HTML)"
+    echo "  0) Cancel"
+    local site_type
+    while true; do
+        echo -e "${YELLOW}Select [1-4]:${NC} \c"
+        read -r site_type
+        [[ "$site_type" == "0" ]] && { log_info "Cancelled."; return 0; }
+        [[ "$site_type" =~ ^[1-4]$ ]] && break
+        log_warn "Invalid selection."
+    done
+
+    # --- PHP version (not needed for static) ---
+    local php_ver="" socket=""
+    if [[ "$site_type" != "4" ]]; then
+        SELECTED_PHP_VERSION=""
+        select_php_version || return 1
+        php_ver="$SELECTED_PHP_VERSION"
+    fi
+
+    # --- Web user ---
+    local site_user=""
+    if [[ "$site_type" != "4" ]]; then
+        echo -e "\n${BOLD}Web user (PHP-FPM runs as this user):${NC}"
+        echo "  1) Select existing user"
+        echo "  2) Create new user"
+        echo "  0) Cancel"
+        local _uopt
+        echo -e "${YELLOW}Select [0-2]:${NC} \c"; read -r _uopt
+        SELECTED_WEB_USER=""
+        case "$_uopt" in
+            1)
+                _select_web_user "Select user" || return 1
+                site_user="$SELECTED_WEB_USER"
+                ;;
+            2)
+                _create_web_user_interactive || return 1
+                site_user="$SELECTED_WEB_USER"
+                echo ""
+                ;;
+            0) log_info "Cancelled."; return 0 ;;
+            *)
+                log_warn "Invalid selection."; return 1 ;;
+        esac
+        socket=$(get_php_pool_socket "$php_ver" "$domain")
+    fi
+
+    # --- Directories ---
+    local site_dir="/home/web/${site_user}/${domain}"
+    local web_root
+    [[ "$site_type" == "2" ]] && web_root="${site_dir}/public" \
+                               || web_root="${site_dir}/public_html"
+    mkdir -p "/home/web/${site_user}"
+    # For Laravel: composer create-project needs $site_dir to be empty/absent.
+    # We create the web_root and ACME dir AFTER composer runs (see Laravel case below).
+    if [[ "$site_type" != "2" ]]; then
+        mkdir -p "$web_root"
+        mkdir -p "${web_root}/.well-known/acme-challenge"
+    fi
+
+    local web_user="${site_user:-www-data}"
+
+    # --- Site-type specific setup ---
+    local type_name="" wp_ver_used="" laravel_ver_used=""
+    local db_name_created="" db_user_created="" db_pass_created=""
+
+    case "$site_type" in
+        1) # PHP plain
+            type_name="php"
+            cat > "${web_root}/index.php" <<'PHP'
+<?php echo "<h1>PHP site is ready!</h1>"; phpinfo();
+PHP
+            ;;
+
+        2) # Laravel
+            type_name="laravel"
+            echo -e "\n${BOLD}Laravel version [Enter for latest]:${NC} \c"
+            read -r _lver
+
+            # Ensure composer is installed
+            if ! command -v composer &>/dev/null; then
+                log_info "Installing Composer..."
+                curl -fsSL https://getcomposer.org/installer \
+                    | php -- --install-dir=/usr/local/bin --filename=composer --quiet 2>/dev/null \
+                    || { log_error "Failed to install Composer."; return 1; }
+            fi
+
+            # Remove leftover dir from any previous failed attempt (nginx conf doesn't exist = safe to clean)
+            if [[ -d "$site_dir" ]]; then
+                log_info "Removing leftover directory from previous attempt..."
+                rm -rf "$site_dir"
+            fi
+
+            log_info "Creating Laravel project (this may take a few minutes)..."
+            if [[ -z "$_lver" ]]; then
+                COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel "$site_dir" \
+                    --prefer-dist --no-interaction \
+                    && laravel_ver_used="latest" \
+                    || { log_error "Laravel install failed."; return 1; }
+            else
+                COMPOSER_ALLOW_SUPERUSER=1 composer create-project "laravel/laravel:^${_lver}" "$site_dir" \
+                    --prefer-dist --no-interaction \
+                    && laravel_ver_used="$_lver" \
+                    || { log_error "Laravel ${_lver} install failed."; return 1; }
+            fi
+
+            # Create ACME challenge dir now that composer has built the structure
+            mkdir -p "${web_root}/.well-known/acme-challenge"
+
+            # --- Database selection ---
+            local _ldb_type=""
+            echo -e "\n${BOLD}Database:${NC}"
+            local _db_opts=()
+            command -v mysql &>/dev/null || command -v mariadb &>/dev/null \
+                && _db_opts+=("MySQL/MariaDB")
+            command -v psql &>/dev/null \
+                && _db_opts+=("PostgreSQL")
+            _db_opts+=("SQLite")
+
+            local _di=1
+            for _dopt in "${_db_opts[@]}"; do
+                printf "  %d) %s\n" "$_di" "$_dopt"
+                ((_di++)) || true
+            done
+            local _dsel
+            echo -e "${YELLOW}Select [1-$((${#_db_opts[@]}))]:${NC} \c"
+            read -r _dsel
+            if [[ "$_dsel" =~ ^[0-9]+$ ]] && [[ "$_dsel" -ge 1 ]] && [[ "$_dsel" -le ${#_db_opts[@]} ]]; then
+                _ldb_type="${_db_opts[$((${_dsel}-1))]}"
+            else
+                _ldb_type="${_db_opts[0]}"  # default to first available
+            fi
+            log_info "Database: ${_ldb_type}"
+
+            local env_file="${site_dir}/.env"
+            local _ldb_name _ldb_user _ldb_pass
+            _ldb_name="db_$(echo "$domain" | tr '.-' '_' | cut -c1-12)_$(rand_str 4)"
+            _ldb_user="u_$(rand_str 10)"
+            _ldb_pass=$(rand_str 24)
+            _ldb_name="${_ldb_name,,}"
+            _ldb_user="${_ldb_user,,}"
+
+            case "$_ldb_type" in
+                "MySQL/MariaDB")
+                    if mysql_exec "CREATE DATABASE \`${_ldb_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+                       && mysql_exec "CREATE USER '${_ldb_user}'@'localhost' IDENTIFIED BY '${_ldb_pass}';" \
+                       && mysql_exec "GRANT ALL PRIVILEGES ON \`${_ldb_name}\`.* TO '${_ldb_user}'@'localhost';" \
+                       && mysql_exec "FLUSH PRIVILEGES;"; then
+
+                        mkdir -p "$CONFIG_DIR"
+                        touch "$DB_LIST_FILE" && chmod 600 "$DB_LIST_FILE"
+                        sed -i "/^${domain}|/d" "$DB_LIST_FILE" 2>/dev/null || true
+                        local _lenc; _lenc=$(encrypt_pass "$_ldb_pass")
+                        echo "${domain}|${_ldb_name}|${_ldb_user}|${_lenc}|mysql" >> "$DB_LIST_FILE"
+                        db_name_created="$_ldb_name"
+                        db_user_created="$_ldb_user"
+                        db_pass_created="$_ldb_pass"
+
+                        if [[ -f "$env_file" ]]; then
+                            sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=mysql/"         "$env_file"
+                            sed -i "s/^#\? *DB_HOST=.*/DB_HOST=127.0.0.1/"           "$env_file"
+                            sed -i "s/^#\? *DB_PORT=.*/DB_PORT=3306/"                "$env_file"
+                            sed -i "s/^#\? *DB_DATABASE=.*/DB_DATABASE=${_ldb_name}/" "$env_file"
+                            sed -i "s/^#\? *DB_USERNAME=.*/DB_USERNAME=${_ldb_user}/" "$env_file"
+                            sed -i "s/^#\? *DB_PASSWORD=.*/DB_PASSWORD=${_ldb_pass}/" "$env_file"
+                            log_success "Laravel .env configured with MySQL."
+                        fi
+                    else
+                        log_warn "Database creation failed. Configure .env manually."
+                    fi
+                    ;;
+
+                "PostgreSQL")
+                    if sudo -u postgres psql -c "CREATE DATABASE ${_ldb_name};" 2>/dev/null \
+                       && sudo -u postgres psql -c "CREATE USER ${_ldb_user} WITH PASSWORD '${_ldb_pass}';" 2>/dev/null \
+                       && sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${_ldb_name} TO ${_ldb_user};" 2>/dev/null; then
+
+                        mkdir -p "$CONFIG_DIR"
+                        touch "$DB_LIST_FILE" && chmod 600 "$DB_LIST_FILE"
+                        sed -i "/^${domain}|/d" "$DB_LIST_FILE" 2>/dev/null || true
+                        local _lenc_pg; _lenc_pg=$(encrypt_pass "$_ldb_pass")
+                        echo "${domain}|${_ldb_name}|${_ldb_user}|${_lenc_pg}|pgsql" >> "$DB_LIST_FILE"
+                        db_name_created="$_ldb_name"
+                        db_user_created="$_ldb_user"
+                        db_pass_created="$_ldb_pass"
+
+                        if [[ -f "$env_file" ]]; then
+                            sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=pgsql/"         "$env_file"
+                            sed -i "s/^#\? *DB_HOST=.*/DB_HOST=127.0.0.1/"           "$env_file"
+                            sed -i "s/^#\? *DB_PORT=.*/DB_PORT=5432/"                "$env_file"
+                            sed -i "s/^#\? *DB_DATABASE=.*/DB_DATABASE=${_ldb_name}/" "$env_file"
+                            sed -i "s/^#\? *DB_USERNAME=.*/DB_USERNAME=${_ldb_user}/" "$env_file"
+                            sed -i "s/^#\? *DB_PASSWORD=.*/DB_PASSWORD=${_ldb_pass}/" "$env_file"
+                            log_success "Laravel .env configured with PostgreSQL."
+                        fi
+                    else
+                        log_warn "PostgreSQL database creation failed. Configure .env manually."
+                    fi
+                    ;;
+
+                "SQLite")
+                    touch "${site_dir}/database/database.sqlite" 2>/dev/null || true
+                    if [[ -f "$env_file" ]]; then
+                        sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=sqlite/" "$env_file"
+                    fi
+                    log_success "Laravel .env configured with SQLite."
+                    log_warn "Ensure php-sqlite3 extension is installed."
+                    ;;
+            esac
+
+            # Default session driver to file (database driver requires migrations first)
+            if [[ -f "$env_file" ]]; then
+                sed -i "s/^SESSION_DRIVER=.*/SESSION_DRIVER=file/" "$env_file"
+            fi
+
+            # Set permissions
+            _set_site_perms "$site_dir" "$web_user"
+
+            # Generate app key
+            cd "$site_dir" && php artisan key:generate --quiet 2>/dev/null || true
+            cd - >/dev/null
+            log_success "Laravel installed."
+            ;;
+
+        3) # WordPress
+            type_name="wordpress"
+            echo -e "\n${BOLD}WordPress version [Enter for latest]:${NC} \c"
+            read -r _wpver
+
+            local wp_url
+            if [[ -z "$_wpver" ]]; then
+                wp_url="https://wordpress.org/latest.tar.gz"
+                wp_ver_used="latest"
+            else
+                wp_url="https://wordpress.org/wordpress-${_wpver}.tar.gz"
+                wp_ver_used="$_wpver"
+            fi
+
+            log_info "Downloading WordPress ${wp_ver_used}..."
+            if curl -fsSL "$wp_url" | tar -xz -C "$web_root" --strip-components=1 2>/dev/null; then
+                log_success "WordPress downloaded."
+            else
+                log_warn "WordPress download failed. Please upload files manually."
+            fi
+
+            # Auto-create database for WordPress
+            echo ""
+            if confirm_action "Auto-create database and configure wp-config.php?"; then
+                local _db_name _db_user _db_pass
+                _db_name="db_$(echo "$domain" | tr '.-' '_' | cut -c1-12)_$(rand_str 4)"
+                _db_user="u_$(rand_str 10)"
+                _db_pass=$(rand_str 24)
+                _db_name="${_db_name,,}"
+                _db_user="${_db_user,,}"
+
+                if mysql_exec "CREATE DATABASE \`${_db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+                   && mysql_exec "CREATE USER '${_db_user}'@'localhost' IDENTIFIED BY '${_db_pass}';" \
+                   && mysql_exec "GRANT ALL PRIVILEGES ON \`${_db_name}\`.* TO '${_db_user}'@'localhost';" \
+                   && mysql_exec "FLUSH PRIVILEGES;"; then
+
+                    # Save to db_list
+                    mkdir -p "$CONFIG_DIR"
+                    touch "$DB_LIST_FILE" && chmod 600 "$DB_LIST_FILE"
+                    sed -i "/^${domain}|/d" "$DB_LIST_FILE" 2>/dev/null || true
+                    local _enc; _enc=$(encrypt_pass "$_db_pass")
+                    echo "${domain}|${_db_name}|${_db_user}|${_enc}|mysql" >> "$DB_LIST_FILE"
+
+                    db_name_created="$_db_name"
+                    db_user_created="$_db_user"
+                    db_pass_created="$_db_pass"
+
+                    # Configure wp-config.php
+                    if [[ -f "${web_root}/wp-config-sample.php" ]]; then
+                        cp "${web_root}/wp-config-sample.php" "${web_root}/wp-config.php"
+                        sed -i "s/database_name_here/${_db_name}/" "${web_root}/wp-config.php"
+                        sed -i "s/username_here/${_db_user}/" "${web_root}/wp-config.php"
+                        sed -i "s/password_here/${_db_pass}/" "${web_root}/wp-config.php"
+                        sed -i "s/localhost/127.0.0.1/" "${web_root}/wp-config.php"
+                        # Fetch auth keys/salts
+                        local _salts
+                        _salts=$(curl -fsSL "https://api.wordpress.org/secret-key/1.1/salt/" 2>/dev/null || true)
+                        if [[ -n "$_salts" ]]; then
+                            local _tmp="${web_root}/wp-config.php.tmp"
+                            awk -v salts="$_salts" '
+                                /define\(.AUTH_KEY/ { found=1 }
+                                found && /define\(.NONCE_SALT/ { print salts; found=0; next }
+                                !found { print }
+                            ' "${web_root}/wp-config.php" > "$_tmp" && mv "$_tmp" "${web_root}/wp-config.php"
+                        fi
+                        chmod 640 "${web_root}/wp-config.php"
+                        log_success "wp-config.php configured."
+                    fi
+                else
+                    log_warn "Database creation failed. Configure wp-config.php manually."
+                fi
+            fi
+            ;;
+
+        4) # Static
+            type_name="static"
+            cat > "${web_root}/index.html" <<'HTML'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Static Site</title></head>
+<body><h1>Static site is ready!</h1></body></html>
+HTML
+            ;;
+    esac
+
+    _set_site_perms "$site_dir" "$web_user"
+
+    # --- PHP-FPM per-site pool ---
+    if [[ -n "$php_ver" && -n "$site_user" ]]; then
+        create_php_pool "$php_ver" "$domain" "$site_user"
+    fi
+
+    # --- Nginx config ---
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    case "$site_type" in
+        1) nginx_tpl_php       "$domain" "$web_root" "$socket" > "$nginx_conf" ;;
+        2) nginx_tpl_laravel   "$domain" "$web_root" "$socket" > "$nginx_conf" ;;
+        3) nginx_tpl_wordpress "$domain" "$web_root" "$socket" > "$nginx_conf" ;;
+        4) nginx_tpl_static    "$domain" "$web_root"           > "$nginx_conf" ;;
+    esac
+
+    if ! nginx -t &>/dev/null; then
+        log_error "Nginx config test failed. Rolling back..."
+        rm -f "$nginx_conf"
+        press_enter; return 1
+    fi
+    nginx -s reload
+
+    # --- Metadata ---
+    mkdir -p "$SITES_META_DIR"
+    cat > "${SITES_META_DIR}/${domain}.conf" <<EOF
+DOMAIN=${domain}
+TYPE=${type_name}
+PHP_VERSION=${php_ver}
+WEB_ROOT=${web_root}
+SITE_DIR=${site_dir}
+WEB_USER=${site_user}
+DISABLE_FUNCTIONS=1
+CREATED=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+    chmod 600 "${SITES_META_DIR}/${domain}.conf"
+
+    # --- SSL ---
+    echo ""
+    local ssl_status="None"
+    echo -e "${BOLD}SSL setup:${NC}"
+    echo "  1) Free — Let's Encrypt"
+    echo "  2) Paid — custom certificate"
+    echo "  3) Skip"
+    local _ssl_choice
+    echo -e "${YELLOW}Select [1-3]:${NC} \c"; read -r _ssl_choice
+    case "$_ssl_choice" in
+        1) setup_ssl_free "$domain" && ssl_status="Let's Encrypt" ;;
+        2) setup_ssl_paid "$domain" && ssl_status="Custom cert" ;;
+        *) log_info "Skipping SSL." ;;
+    esac
+
+    # --- Show site summary ---
+    echo ""
+    echo -e "${BOLD}${GREEN}  ╔══════════════════════════════════════════════════════╗"
+    echo    "  ║               SITE CREATED SUCCESSFULLY              ║"
+    echo -e "  ╚══════════════════════════════════════════════════════╝${NC}"
+    printf "  %-12s: %s\n"  "Domain"   "$domain"
+    printf "  %-12s: %s\n"  "Type"     "$type_name"
+    printf "  %-12s: %s\n"  "Web root" "$web_root"
+    printf "  %-12s: %s\n"  "PHP"      "${php_ver:-N/A}"
+    printf "  %-12s: %s\n"  "SSL"      "$ssl_status"
+    if [[ -n "$db_name_created" ]]; then
+        printf "  %-12s: %s\n"  "DB name"  "$db_name_created"
+        printf "  %-12s: %s\n"  "DB user"  "$db_user_created"
+        printf "  %-12s: %s\n"  "DB pass"  "$db_pass_created"
+    elif [[ "$site_type" != "4" ]]; then
+        echo ""
+        confirm_action "Create a database for ${domain}?" && _create_db_for "$domain" "mysql" || true
+    fi
+    echo ""
+    press_enter
+}
+
+setup_ssl_free() {
+    local domain="$1"
+    if ! command -v certbot &>/dev/null; then
+        log_error "Certbot not installed. Go to System → Install extra service."
+        return 1
+    fi
+
+    local ssl_email ssl_email_file="${CONFIG_DIR}/ssl_email"
+    if [[ -f "$ssl_email_file" ]]; then
+        ssl_email=$(cat "$ssl_email_file")
+        log_info "Using saved SSL email: ${ssl_email}"
+    else
+        while true; do
+            echo -e "${BOLD}Email for Let's Encrypt (or 0 to cancel):${NC} \c"
+            read -r ssl_email
+            [[ "$ssl_email" == "0" ]] && return 1
+            [[ "$ssl_email" =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
+            log_warn "Invalid email format."
+        done
+        echo "$ssl_email" > "$ssl_email_file"
+        chmod 600 "$ssl_email_file"
+    fi
+
+    # Ensure port 80/443 open so ACME challenge can reach the server
+    _open_http_https
+
+    # Shared webroot for ACME challenge — matches nginx location block
+    local acme_root="/var/lib/letsencrypt/http_challenges"
+    mkdir -p "$acme_root"
+    chmod 755 "$acme_root"
+    # Fix SELinux context so nginx can read challenge files (AlmaLinux)
+    command -v chcon &>/dev/null && chcon -R -t httpd_sys_content_t "$acme_root" 2>/dev/null || true
+
+    log_info "Running certbot for ${domain}..."
+    # Use --webroot so certbot places challenge files where nginx serves them
+    if certbot certonly --webroot -w "$acme_root" \
+            -d "$domain" -d "www.${domain}" \
+            --non-interactive --agree-tos -m "$ssl_email" 2>/dev/null \
+    || certbot certonly --webroot -w "$acme_root" \
+            -d "$domain" \
+            --non-interactive --agree-tos -m "$ssl_email"; then
+        # Install cert into nginx config
+        certbot install --nginx --cert-name "$domain" --non-interactive 2>/dev/null || true
+        nginx -t &>/dev/null && nginx -s reload
+    else
+        log_error "certbot failed. Make sure DNS is pointing to this server."
+        return 1
+    fi
+
+    # Cron renewal every 2 weeks (every other Sunday 03:30) — skip if systemd timer exists
+    if ! systemctl is-enabled certbot.timer &>/dev/null \
+       && ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+        (crontab -l 2>/dev/null
+         echo "30 3 * * 0 [ \$(( \$(date +\%s) / 604800 % 2 )) -eq 0 ] && /usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx'"
+        ) | crontab -
+        log_info "Auto-renewal cron added (every 2 weeks on Sunday 03:30)."
+    fi
+
+    log_success "SSL (Let's Encrypt) installed for ${domain}."
+}
+
+setup_ssl_paid() {
+    local domain="$1"
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+
+    echo -e "${BOLD}Path to SSL certificate file (.crt / .pem):${NC} \c"
+    read -r _cert_path
+    echo -e "${BOLD}Path to SSL private key file (.key):${NC} \c"
+    read -r _key_path
+
+    if [[ ! -f "$_cert_path" ]]; then
+        log_error "Certificate file not found: $_cert_path"; return 1
+    fi
+    if [[ ! -f "$_key_path" ]]; then
+        log_error "Key file not found: $_key_path"; return 1
+    fi
+
+    local ssl_cert_dir="/etc/nginx/ssl/${domain}"
+    mkdir -p "$ssl_cert_dir"
+    cp "$_cert_path" "${ssl_cert_dir}/fullchain.pem"
+    cp "$_key_path"  "${ssl_cert_dir}/privkey.pem"
+    chmod 600 "${ssl_cert_dir}/privkey.pem"
+
+    # Append SSL server block to nginx config
+    cat >> "$nginx_conf" <<EOF
+
+server {
+    listen 443 ssl;
+    server_name ${domain} www.${domain};
+    ssl_certificate     ${ssl_cert_dir}/fullchain.pem;
+    ssl_certificate_key ${ssl_cert_dir}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    include $(dirname "$nginx_conf")/snippets/security-headers.conf 2>/dev/null;
+}
+EOF
+
+    nginx -t &>/dev/null && nginx -s reload \
+        && log_success "Paid SSL configured for ${domain}." \
+        || { log_error "Nginx config invalid after SSL setup."; return 1; }
+}
+
+_nginx_remove_h2_h3() {
+    local _conf="$1"
+    sed -i '/^[ \t]*http2 on;/d'            "$_conf"
+    sed -i '/^[ \t]*http3 on;/d'            "$_conf"
+    sed -i '/^[ \t]*listen 443 quic/d'      "$_conf"
+    sed -i '/Alt-Svc.*h3/d'                 "$_conf"
+    sed -i 's/listen 443 ssl http2;/listen 443 ssl;/' "$_conf"
+}
+
+toggle_http_protocol() {
+    print_section "HTTP PROTOCOL"
+
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+
+    if ! grep -q "ssl_certificate" "$_conf" 2>/dev/null; then
+        log_warn "SSL is required for HTTP/2 and HTTP/3. Enable SSL first."
+        press_enter; return
+    fi
+
+    local _nginx_ver; _nginx_ver=$(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1)
+    local _maj _min
+    _maj=$(echo "$_nginx_ver" | cut -d. -f1)
+    _min=$(echo "$_nginx_ver" | cut -d. -f2)
+
+    # Detect current protocol
+    local _cur="HTTP/1"
+    grep -q "http3 on\|listen 443 quic" "$_conf" && _cur="HTTP/3"
+    [[ "$_cur" == "HTTP/1" ]] && { grep -q "http2 on\|ssl http2" "$_conf" && _cur="HTTP/2"; }
+
+    echo -e "\n  Site    : ${BOLD}${domain}${NC}"
+    echo -e "  Current : ${GREEN}${_cur}${NC}\n"
+    echo "  1) HTTP/1  (default)"
+    echo "  2) HTTP/2  (requires SSL)"
+    echo "  3) HTTP/3  (requires SSL + nginx ≥ 1.25)"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+
+    case "$_ch" in
+        1)
+            _nginx_remove_h2_h3 "$_conf"
+            log_success "HTTP/1 set for ${domain}."
+            ;;
+        2)
+            [[ "$_cur" == "HTTP/2" ]] && { log_info "Already HTTP/2."; press_enter; return; }
+            _nginx_remove_h2_h3 "$_conf"
+            sed -i '/listen 443 ssl/a\    http2 on;' "$_conf"
+            log_success "HTTP/2 enabled for ${domain}."
+            ;;
+        3)
+            if [[ "$_maj" -lt 1 ]] || [[ "$_maj" -eq 1 && "$_min" -lt 25 ]]; then
+                log_warn "Nginx ${_nginx_ver} < 1.25 — HTTP/3 not supported. Run repair to upgrade."
+                press_enter; return
+            fi
+            [[ "$_cur" == "HTTP/3" ]] && { log_info "Already HTTP/3."; press_enter; return; }
+            _nginx_remove_h2_h3 "$_conf"
+            sed -i '/listen 443 ssl/a\    http2 on;\n    http3 on;\n    listen 443 quic reuseport;\n    add_header Alt-Svc '"'"'h3=":443"; ma=86400'"'"';' "$_conf"
+            # Open UDP 443 in firewall
+            if command -v firewall-cmd &>/dev/null; then
+                firewall-cmd --permanent --add-port=443/udp &>/dev/null || true
+                firewall-cmd --reload &>/dev/null || true
+            elif command -v ufw &>/dev/null; then
+                ufw allow 443/udp &>/dev/null || true
+            fi
+            log_success "HTTP/3 enabled for ${domain} (UDP 443 opened)."
+            ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
+    press_enter
+}
+
+# Legacy alias so old call sites still work
+setup_ssl() { setup_ssl_free "$@"; }
+
+delete_website() {
+    print_section "DELETE WEBSITE"
+
+    SELECTED_DOMAIN=""
+    _select_domain || return 0
+    local domain="$SELECTED_DOMAIN"
+
+    confirm_danger "Delete website ${domain}" || { log_info "Cancelled."; return 0; }
+
+    # Remove nginx config
+    rm -f "${NGINX_CONF_DIR}/${domain}.conf"
+    nginx -t &>/dev/null && nginx -s reload
+    log_success "Nginx config removed."
+
+    # Remove PHP-FPM per-site pool
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _php_ver="" _site_user=""
+    if [[ -f "$_meta" ]]; then
+        _php_ver=$(grep "^PHP_VERSION=" "$_meta" | cut -d= -f2)
+        _site_user=$(grep "^WEB_USER=" "$_meta" | cut -d= -f2)
+    fi
+    [[ -n "$_php_ver" && -n "$_site_user" ]] && remove_php_pool "$_php_ver" "$domain" || true
+
+    # Delete site files automatically (user already confirmed with CONFIRM)
+    local site_dir; site_dir="$(get_site_dir "$domain")"
+    if [[ -d "$site_dir" ]]; then
+        rm -rf "$site_dir"
+        log_success "Site files removed: ${site_dir}"
+    fi
+
+    # Ask about database separately (destructive data, user may want to keep)
+    echo ""
+    confirm_action "Also delete the database for ${domain}?" && _delete_db_for "$domain" || true
+
+    rm -f "${SITES_META_DIR}/${domain}.conf"
+    log_success "Website ${domain} fully removed."
+    press_enter
+}
+
+_list_websites_inline() {
+    echo -e "\n${BOLD}Website list:${NC}"
+    separator
+    local count=0
+    # Check both active (.conf) and locked (.conf.disabled) nginx configs
+    for conf in "${NGINX_CONF_DIR}"/*.conf "${NGINX_CONF_DIR}"/*.conf.disabled; do
+        [[ -f "$conf" ]] || continue
+        local dom
+        dom=$(basename "$conf" .conf)
+        dom="${dom%.disabled}"
+        [[ "$dom" == "default" || "$dom" == "phpmyadmin" ]] && continue
+
+        local php_ver="N/A" ssl_str="No" status_str=""
+        local meta="${SITES_META_DIR}/${dom}.conf"
+        [[ -f "$meta" ]] && php_ver=$(grep -oP '(?<=PHP_VERSION=)[^\n]*' "$meta" 2>/dev/null || echo "N/A")
+        grep -q "ssl_certificate" "$conf" 2>/dev/null && ssl_str="${GREEN}Yes${NC}"
+        local _st; _st=$(grep "^STATUS=" "$meta" 2>/dev/null | cut -d= -f2)
+        [[ "$_st" == "locked" ]] && status_str=" ${RED}[LOCKED]${NC}"
+
+        printf "  %-35s PHP: %-6s SSL: %b%b\n" "$dom" "$php_ver" "$ssl_str" "$status_str"
+        ((count++)) || true
+    done
+    separator
+    echo -e "  Total: ${BOLD}${count}${NC} website(s)"
+}
+
+# Select domain by number. Sets SELECTED_DOMAIN. Returns 1 if cancelled.
+SELECTED_DOMAIN=""
+_select_domain() {
+    local prompt="${1:-Select site}"
+    local -a _domains=()
+    for conf in "${NGINX_CONF_DIR}"/*.conf "${NGINX_CONF_DIR}"/*.conf.disabled; do
+        [[ -f "$conf" ]] || continue
+        local dom; dom=$(basename "$conf" .conf)
+        dom="${dom%.disabled}"
+        [[ "$dom" == "default" || "$dom" == "phpmyadmin" ]] && continue
+        # avoid duplicates
+        [[ " ${_domains[*]} " == *" ${dom} "* ]] && continue
+        _domains+=("$dom")
+    done
+
+    if [[ ${#_domains[@]} -eq 0 ]]; then
+        log_warn "No websites found."; return 1
+    fi
+
+    echo ""
+    local i=1
+    for d in "${_domains[@]}"; do
+        local _st; _st=$(grep "^STATUS=" "${SITES_META_DIR}/${d}.conf" 2>/dev/null | cut -d= -f2)
+        local _lock_str=""
+        [[ "$_st" == "locked" ]] && _lock_str=" ${RED}[LOCKED]${NC}"
+        printf "  %2d) %s%b\n" "$i" "$d" "$_lock_str"
+        ((i++)) || true
+    done
+    echo -e "   0) Cancel"
+    echo -ne "\n  ${prompt} [1-$((i-1))]: "
+    read -r _sel
+
+    if [[ "$_sel" == "0" || -z "$_sel" ]]; then return 1; fi
+    if [[ ! "$_sel" =~ ^[0-9]+$ ]] || [[ "$_sel" -lt 1 ]] || [[ "$_sel" -gt ${#_domains[@]} ]]; then
+        log_warn "Invalid selection."; return 1
+    fi
+    SELECTED_DOMAIN="${_domains[$((${_sel}-1))]}"
+}
+
+list_websites() {
+    print_section "WEBSITE LIST"
+    _list_websites_inline
+    press_enter
+}
+
+show_website_detail() {
+    print_section "WEBSITE DETAIL"
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    if [[ ! -f "$nginx_conf" ]]; then
+        log_error "Website not found: ${domain}"
+        press_enter; return 1
+    fi
+
+    separator
+    echo -e "${BOLD}Domain      :${NC} $domain"
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    if [[ -f "$meta" ]]; then
+        local _type _php _root _created
+        _type=$(    grep -oP '(?<=TYPE=)[^\n]*'         "$meta" 2>/dev/null || echo "N/A")
+        _php=$(     grep -oP '(?<=PHP_VERSION=)[^\n]*'  "$meta" 2>/dev/null || echo "N/A")
+        _root=$(    grep -oP '(?<=WEB_ROOT=)[^\n]*'     "$meta" 2>/dev/null || echo "N/A")
+        _created=$( grep -oP '(?<=CREATED=)[^\n]*'      "$meta" 2>/dev/null || echo "N/A")
+        echo -e "${BOLD}Type        :${NC} $_type"
+        echo -e "${BOLD}PHP version :${NC} $_php"
+        echo -e "${BOLD}Web root    :${NC} $_root"
+        echo -e "${BOLD}Created     :${NC} $_created"
+        [[ -n "$_php" && "$_php" != "N/A" ]] \
+            && echo -e "${BOLD}PHP socket  :${NC} $(get_php_socket "$_php")"
+    fi
+
+    # SSL info
+    local ssl_info="${YELLOW}Not installed${NC}"
+    if grep -q "ssl_certificate" "$nginx_conf" 2>/dev/null; then
+        local cert_file
+        cert_file=$(grep -oP '(?<=ssl_certificate )[^;]+' "$nginx_conf" 2>/dev/null | head -1 | xargs)
+        if [[ -n "$cert_file" && -f "$cert_file" ]]; then
+            local expiry
+            expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+            ssl_info="${GREEN}Installed${NC} — expires: $expiry"
+        else
+            ssl_info="${GREEN}Installed${NC} (cert file unreadable)"
+        fi
+    fi
+    echo -e "${BOLD}SSL         :${NC} $ssl_info"
+
+    # Framework detection
+    local site_dir; site_dir="$(get_site_dir "$domain")"
+    [[ -f "${site_dir}/artisan" && -f "${site_dir}/.env" ]] \
+        && echo -e "${BOLD}Framework   :${NC} ${GREEN}Laravel${NC} (artisan + .env found)"
+    [[ -f "${site_dir}/wp-config.php" || -f "${site_dir}/public_html/wp-config.php" ]] \
+        && echo -e "${BOLD}Framework   :${NC} ${BOLD}WordPress${NC} (wp-config.php found)"
+
+    # Database info
+    if [[ -f "$DB_LIST_FILE" ]]; then
+        local db_line
+        db_line=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null || true)
+        if [[ -n "$db_line" ]]; then
+            local _db_name _db_user _enc _type _pass
+            IFS='|' read -r _ _db_name _db_user _enc _type <<< "$db_line"
+            _pass=$(decrypt_pass "$_enc" 2>/dev/null) || _pass="[decrypt error]"
+            [[ -z "$_pass" ]] && _pass="[decrypt error]"
+            echo -e "\n${BOLD}Database    :${NC}"
+            echo -e "  Name : $_db_name"
+            echo -e "  User : $_db_user"
+            echo -e "  Pass : $_pass"
+            echo -e "  Type : $_type"
+        fi
+    fi
+
+    echo -e "\n${BOLD}Nginx config:${NC} $nginx_conf"
+    separator
+    press_enter
+}
+
+toggle_php_hardening() {
+    print_section "PHP HARDENING"
+
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+
+    local _php_ver="" _site_user="" _cur_state=""
+    [[ -f "$_meta" ]] && {
+        _php_ver=$(grep "^PHP_VERSION=" "$_meta" | cut -d= -f2)
+        _site_user=$(grep "^WEB_USER=" "$_meta" | cut -d= -f2)
+        _cur_state=$(grep "^DISABLE_FUNCTIONS=" "$_meta" | cut -d= -f2)
+    }
+    _cur_state="${_cur_state:-1}"
+
+    local _pool_conf; _pool_conf=$(get_php_pool_conf "$_php_ver" "$domain")
+
+    echo -e "\n  Site        : ${BOLD}${domain}${NC}"
+    if [[ "$_cur_state" == "1" ]]; then
+        echo -e "  Hardening   : ${GREEN}ON${NC} (dangerous functions blocked)"
+    else
+        echo -e "  Hardening   : ${YELLOW}OFF${NC} (all functions allowed)"
+    fi
+    echo ""
+
+    if [[ "$_cur_state" == "1" ]]; then
+        echo "  1) Turn OFF (allow all functions)"
+        echo "  0) Cancel"
+        echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+        [[ "$_ch" != "1" ]] && return 0
+        # Remove disable_functions from pool
+        sed -i "/^php_admin_value\[disable_functions\]/d" "$_pool_conf" 2>/dev/null || true
+        sed -i "s/^DISABLE_FUNCTIONS=.*/DISABLE_FUNCTIONS=0/" "$_meta"
+        grep -q "^DISABLE_FUNCTIONS=" "$_meta" || echo "DISABLE_FUNCTIONS=0" >> "$_meta"
+        log_warn "Hardening OFF for ${domain} — dangerous functions allowed."
+    else
+        echo "  1) Turn ON (block dangerous functions)"
+        echo "  0) Cancel"
+        echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+        [[ "$_ch" != "1" ]] && return 0
+        # Remove old entry then add
+        sed -i "/^php_admin_value\[disable_functions\]/d" "$_pool_conf" 2>/dev/null || true
+        echo "php_admin_value[disable_functions] = ${DANGEROUS_FUNCTIONS}" >> "$_pool_conf"
+        sed -i "s/^DISABLE_FUNCTIONS=.*/DISABLE_FUNCTIONS=1/" "$_meta"
+        grep -q "^DISABLE_FUNCTIONS=" "$_meta" || echo "DISABLE_FUNCTIONS=1" >> "$_meta"
+        log_success "Hardening ON for ${domain} — dangerous functions blocked."
+    fi
+
+    local svc; svc=$(get_php_service "$_php_ver")
+    systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+    press_enter
+}
+
+manage_upload_settings() {
+    print_section "UPLOAD & TIMEOUT SETTINGS"
+
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+
+    local _php_ver="" _site_type=""
+    [[ -f "$_meta" ]] && {
+        _php_ver=$(grep "^PHP_VERSION=" "$_meta" | cut -d= -f2)
+        _site_type=$(grep "^TYPE=" "$_meta" | cut -d= -f2)
+    }
+
+    local _pool_conf=""
+    [[ -n "$_php_ver" ]] && _pool_conf=$(get_php_pool_conf "$_php_ver" "$domain")
+
+    # Read current values from nginx conf
+    local _cur_body; _cur_body=$(grep -oP '(?<=client_max_body_size )[^;]+' "$nginx_conf" 2>/dev/null | head -1)
+    local _cur_ftimeout; _cur_ftimeout=$(grep -oP '(?<=fastcgi_read_timeout )[^;]+' "$nginx_conf" 2>/dev/null | head -1)
+    _cur_body="${_cur_body:-64M}"
+    _cur_ftimeout="${_cur_ftimeout:-300}"
+
+    # Read current PHP pool values
+    local _cur_upload="" _cur_post="" _cur_mem="" _cur_exec="" _cur_input=""
+    if [[ -n "$_pool_conf" && -f "$_pool_conf" ]]; then
+        _cur_upload=$(grep "^php_admin_value\[upload_max_filesize\]" "$_pool_conf" | sed 's/.*= //')
+        _cur_post=$(grep   "^php_admin_value\[post_max_size\]"       "$_pool_conf" | sed 's/.*= //')
+        _cur_mem=$(grep    "^php_value\[memory_limit\]"              "$_pool_conf" | sed 's/.*= //')
+        _cur_exec=$(grep   "^php_admin_value\[max_execution_time\]"  "$_pool_conf" | sed 's/.*= //')
+        _cur_input=$(grep  "^php_admin_value\[max_input_time\]"      "$_pool_conf" | sed 's/.*= //')
+    fi
+    _cur_upload="${_cur_upload:-64M}"
+    _cur_post="${_cur_post:-64M}"
+    _cur_mem="${_cur_mem:-128M}"
+    _cur_exec="${_cur_exec:-300}"
+    _cur_input="${_cur_input:-300}"
+
+    echo -e "\n  Site : ${BOLD}${domain}${NC}  (type: ${_site_type:-N/A})"
+    echo ""
+    echo -e "  ${BOLD}── Current settings ─────────────────────────────────${NC}"
+    printf "  %-36s %s\n" "Nginx  client_max_body_size"    "$_cur_body"
+    [[ "$_site_type" != "static" ]] && {
+        printf "  %-36s %s\n" "Nginx  fastcgi_read_timeout"    "$_cur_ftimeout"
+        printf "  %-36s %s\n" "PHP    upload_max_filesize"     "$_cur_upload"
+        printf "  %-36s %s\n" "PHP    post_max_size"           "$_cur_post"
+        printf "  %-36s %s\n" "PHP    memory_limit"            "$_cur_mem"
+        printf "  %-36s %s\n" "PHP    max_execution_time (sec)" "$_cur_exec"
+        printf "  %-36s %s\n" "PHP    max_input_time (sec)"    "$_cur_input"
+    }
+    echo ""
+    echo -e "  ${DIM}(Press Enter to keep current value)${NC}"
+    echo ""
+
+    local _new_body _new_ftimeout _new_upload _new_post _new_mem _new_exec _new_input
+
+    echo -ne "  Nginx client_max_body_size   [${_cur_body}]: "; read -r _new_body
+    _new_body="${_new_body:-$_cur_body}"
+
+    if [[ "$_site_type" != "static" ]]; then
+        echo -ne "  Nginx fastcgi_read_timeout   [${_cur_ftimeout}]: "; read -r _new_ftimeout
+        _new_ftimeout="${_new_ftimeout:-$_cur_ftimeout}"
+
+        echo -ne "  PHP   upload_max_filesize    [${_cur_upload}]: "; read -r _new_upload
+        _new_upload="${_new_upload:-$_cur_upload}"
+
+        echo -ne "  PHP   post_max_size          [${_cur_post}]: "; read -r _new_post
+        _new_post="${_new_post:-$_cur_post}"
+
+        echo -ne "  PHP   memory_limit           [${_cur_mem}]: "; read -r _new_mem
+        _new_mem="${_new_mem:-$_cur_mem}"
+
+        echo -ne "  PHP   max_execution_time     [${_cur_exec}]: "; read -r _new_exec
+        _new_exec="${_new_exec:-$_cur_exec}"
+
+        echo -ne "  PHP   max_input_time         [${_cur_input}]: "; read -r _new_input
+        _new_input="${_new_input:-$_cur_input}"
+    fi
+
+    # Apply to nginx conf
+    if grep -q "client_max_body_size" "$nginx_conf" 2>/dev/null; then
+        sed -i "s|client_max_body_size [^;]*;|client_max_body_size ${_new_body};|g" "$nginx_conf"
+    else
+        sed -i "/server_name /a\\    client_max_body_size ${_new_body};" "$nginx_conf"
+    fi
+
+    if [[ "$_site_type" != "static" ]]; then
+        if grep -q "fastcgi_read_timeout" "$nginx_conf" 2>/dev/null; then
+            sed -i "s|fastcgi_read_timeout [^;]*;|fastcgi_read_timeout ${_new_ftimeout};|g" "$nginx_conf"
+        else
+            sed -i "/fastcgi_pass unix:/a\\        fastcgi_read_timeout ${_new_ftimeout};" "$nginx_conf"
+        fi
+    fi
+
+    # Apply to PHP-FPM pool
+    if [[ -n "$_pool_conf" && -f "$_pool_conf" ]]; then
+        _php_pool_set "$_pool_conf" "php_admin_value[upload_max_filesize]" "$_new_upload"
+        _php_pool_set "$_pool_conf" "php_admin_value[post_max_size]"       "$_new_post"
+        _php_pool_set "$_pool_conf" "php_value[memory_limit]"              "$_new_mem"
+        _php_pool_set "$_pool_conf" "php_admin_value[max_execution_time]"  "$_new_exec"
+        _php_pool_set "$_pool_conf" "php_admin_value[max_input_time]"      "$_new_input"
+
+        local svc; svc=$(get_php_service "$_php_ver")
+        systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+    fi
+
+    reload_nginx
+    log_success "Upload & timeout settings updated for ${domain}."
+    press_enter
+}
+
+manage_site_ssl() {
+    print_section "SSL MANAGEMENT"
+
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+
+    [[ ! -f "$nginx_conf" ]] && { log_error "Nginx config not found for ${domain}."; press_enter; return 1; }
+
+    echo ""
+    if grep -q "ssl_certificate" "$nginx_conf" 2>/dev/null; then
+        local cert_file
+        cert_file=$(grep -oP '(?<=ssl_certificate )[^;]+' "$nginx_conf" 2>/dev/null | head -1 | xargs)
+        if [[ -n "$cert_file" && -f "$cert_file" ]]; then
+            local expiry; expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+            echo -e "  SSL Status : ${GREEN}Installed${NC} — expires: $expiry"
+        else
+            echo -e "  SSL Status : ${GREEN}Installed${NC} (cert file unreadable)"
+        fi
+        echo ""
+        echo "  1) Renew / re-issue Let's Encrypt"
+        echo "  2) Replace with custom certificate"
+        echo "  0) Back"
+    else
+        echo -e "  SSL Status : ${YELLOW}Not installed${NC}"
+        echo ""
+        echo "  1) Install Let's Encrypt (free)"
+        echo "  2) Install custom certificate (paid)"
+        echo "  0) Back"
+    fi
+
+    local _ch
+    echo -ne "${YELLOW}  Select: ${NC}"; read -r _ch
+    case "$_ch" in
+        1) setup_ssl_free "$domain" && log_success "SSL installed/renewed for ${domain}." \
+               || log_warn "SSL setup failed. Check DNS and port 80 are accessible." ;;
+        2) setup_ssl_paid "$domain" && log_success "Custom SSL installed for ${domain}." ;;
+        0) return ;;
+        *) log_warn "Invalid selection." ;;
+    esac
+    press_enter
+}
+
+change_php_version() {
+    print_section "CHANGE PHP VERSION"
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$nginx_conf" ]] && { log_error "Website not found: $domain"; return 1; }
+
+    SELECTED_PHP_VERSION=""
+    select_php_version || return 1
+    local new_php="$SELECTED_PHP_VERSION"
+    local new_socket
+    new_socket=$(get_php_socket "$new_php")
+
+    local old_socket
+    old_socket=$(grep -oP '(?<=fastcgi_pass unix:)[^;]+' "$nginx_conf" 2>/dev/null | head -1 | xargs || true)
+
+    [[ "$old_socket" == "$new_socket" ]] && { log_info "Website is already using PHP $new_php."; return 0; }
+
+    sed -i "s|fastcgi_pass unix:${old_socket}|fastcgi_pass unix:${new_socket}|g" "$nginx_conf"
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    [[ -f "$meta" ]] && sed -i "s|^PHP_VERSION=.*|PHP_VERSION=${new_php}|" "$meta"
+
+    if ! nginx -t &>/dev/null; then
+        log_error "Nginx config error — rolling back."
+        sed -i "s|fastcgi_pass unix:${new_socket}|fastcgi_pass unix:${old_socket}|g" "$nginx_conf"
+        return 1
+    fi
+    nginx -s reload
+    log_success "Switched ${domain} to PHP $new_php."
+    press_enter
+}
+
+# =============================================================================
+# DATABASE MODULE
+# =============================================================================
+
+# Create DB + user + save to db_list.txt
+_create_db_for() {
+    local domain="$1" db_type="${2:-mysql}"
+
+    # Auto-generate credentials
+    local db_name="db_$(echo "$domain" | tr '.-' '_' | cut -c1-14)_$(rand_str 4)"
+    local db_user="u_$(rand_str 10)"
+    local db_pass
+    db_pass=$(rand_str 24)
+    db_name="${db_name,,}"
+    db_user="${db_user,,}"
+
+    case "$db_type" in
+        mysql|mariadb)
+            mysql_exec "CREATE DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || return 1
+            mysql_exec "CREATE USER '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';" || return 1
+            mysql_exec "GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost';" || return 1
+            mysql_exec "FLUSH PRIVILEGES;" || return 1
+            ;;
+        postgresql)
+            sudo -u postgres psql -c "CREATE USER ${db_user} WITH PASSWORD '${db_pass}';" 2>/dev/null || return 1
+            sudo -u postgres psql -c "CREATE DATABASE ${db_name} OWNER ${db_user};" 2>/dev/null || return 1
+            ;;
+        *)
+            log_error "Unsupported DB type: $db_type"
+            return 1
+            ;;
+    esac
+
+    mkdir -p "$CONFIG_DIR"
+    touch "$DB_LIST_FILE" && chmod 600 "$DB_LIST_FILE"
+
+    # Remove old entry if exists
+    sed -i "/^${domain}|/d" "$DB_LIST_FILE" 2>/dev/null || true
+
+    local enc_pass
+    enc_pass=$(encrypt_pass "$db_pass")
+    echo "${domain}|${db_name}|${db_user}|${enc_pass}|${db_type}" >> "$DB_LIST_FILE"
+
+    log_success "Database created!"
+    echo -e "  DB Name : ${BOLD}${db_name}${NC}"
+    echo -e "  DB User : ${BOLD}${db_user}${NC}"
+    echo -e "  DB Pass : ${BOLD}${db_pass}${NC}"
+    echo -e "  DB Type : ${db_type}"
+}
+
+_delete_db_for() {
+    local domain="$1"
+    [[ ! -f "$DB_LIST_FILE" ]] && return 0
+
+    local db_line
+    db_line=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null || true)
+    [[ -z "$db_line" ]] && { log_warn "No database found for: $domain"; return 0; }
+
+    local _db_name _db_user _enc _type
+    IFS='|' read -r _ _db_name _db_user _enc _type <<< "$db_line"
+
+    case "$_type" in
+        mysql|mariadb)
+            mysql_exec "DROP DATABASE IF EXISTS \`${_db_name}\`;"
+            mysql_exec "DROP USER IF EXISTS '${_db_user}'@'localhost';"
+            mysql_exec "FLUSH PRIVILEGES;"
+            ;;
+        postgresql)
+            sudo -u postgres psql -c "DROP DATABASE IF EXISTS ${_db_name};" 2>/dev/null || true
+            sudo -u postgres psql -c "DROP USER IF EXISTS ${_db_user};" 2>/dev/null || true
+            ;;
+    esac
+
+    sed -i "/^${domain}|/d" "$DB_LIST_FILE"
+    log_success "Database removed: $_db_name (user: $_db_user)"
+}
+
+create_database() {
+    print_section "CREATE DATABASE"
+    echo -e "${BOLD}Database type:${NC}"
+    echo "  1) MySQL / MariaDB"
+    echo "  2) PostgreSQL"
+    echo -e "${YELLOW}Select [1-2]:${NC} \c"
+    read -r _ch
+
+    local db_type
+    case "$_ch" in
+        1) db_type="mysql" ;;
+        2) db_type="postgresql" ;;
+        *) log_warn "Invalid selection."; return 1 ;;
+    esac
+
+    echo -e "${BOLD}Enter associated domain (or Enter to skip):${NC} \c"
+    read -r _dom
+    _create_db_for "${_dom:-standalone_$(rand_str 6)}" "$db_type"
+    press_enter
+}
+
+list_databases() {
+    print_section "DATABASE LIST"
+    if [[ ! -f "$DB_LIST_FILE" || ! -s "$DB_LIST_FILE" ]]; then
+        log_info "No databases managed yet."
+        press_enter; return 0
+    fi
+
+    printf "\n  ${BOLD}%-30s %-25s %-20s %-12s${NC}\n" "Domain" "DB Name" "DB User" "Type"
+    separator
+    while IFS='|' read -r dom db_name db_user _enc _type; do
+        printf "  %-30s %-25s %-20s %-12s\n" "$dom" "$db_name" "$db_user" "$_type"
+    done < "$DB_LIST_FILE"
+    separator
+    press_enter
+}
+
+delete_database() {
+    print_section "DELETE DATABASE"
+    list_databases
+
+    echo -e "${BOLD}Enter domain associated with the database:${NC} \c"
+    read -r _dom
+
+    confirm_danger "Delete database for ${_dom}" || { log_info "Cancelled."; return 0; }
+    _delete_db_for "$_dom"
+    press_enter
+}
+
+# =============================================================================
+# CACHE MODULE
+# =============================================================================
+flush_redis() {
+    command -v redis-cli &>/dev/null || { log_warn "Redis is not installed."; return 1; }
+    redis-cli FLUSHALL && log_success "Redis cache flushed." \
+                       || log_error "Failed to flush Redis cache."
+}
+
+flush_memcached() {
+    command -v nc &>/dev/null || { log_warn "netcat (nc) is not installed."; return 1; }
+    if echo "flush_all" | nc -q1 127.0.0.1 11211 &>/dev/null; then
+        log_success "Memcached cache flushed."
+    else
+        log_error "Failed to connect to Memcached."
+    fi
+}
+
+flush_opcache() {
+    local vers_str
+    vers_str=$(get_php_versions)
+    [[ -z "$vers_str" ]] && { log_warn "No PHP-FPM found."; return 1; }
+    local -a vers; read -ra vers <<< "$vers_str"
+    for v in "${vers[@]}"; do
+        [[ -z "$v" ]] && continue
+        local svc; svc=$(get_php_service "$v")
+        systemctl restart "$svc" &>/dev/null \
+            && log_success "PHP $v restarted → Opcache cleared." \
+            || log_warn "Failed to restart PHP $v."
+    done
+}
+
+manage_cache() {
+    while true; do
+        print_section "CACHE MANAGEMENT"
+        echo "  1) Flush Redis cache"
+        echo "  2) Flush Memcached cache"
+        echo "  3) Flush PHP Opcache (restart PHP-FPM)"
+        echo "  4) Flush ALL caches"
+        echo "  0) Back"
+        echo -e "${YELLOW}Select:${NC} \c"
+        read -r _ch
+        case "$_ch" in
+            1) flush_redis;    press_enter ;;
+            2) flush_memcached; press_enter ;;
+            3) flush_opcache;  press_enter ;;
+            4) log_info "Flushing Redis...";     flush_redis     || true
+               log_info "Flushing Memcached..."; flush_memcached || true
+               log_info "Flushing Opcache...";   flush_opcache   || true
+               log_success "All caches flushed."; press_enter ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+# =============================================================================
+# SECURITY MODULE — FIREWALL
+# =============================================================================
+manage_firewall() {
+    local fw; fw=$(detect_firewall)
+
+    while true; do
+        print_section "FIREWALL MANAGEMENT ($fw)"
+
+        local status_str=""
+        case "$fw" in
+            firewalld) status_str=$(systemctl is-active firewalld 2>/dev/null || echo "unknown") ;;
+            ufw)       status_str=$(ufw status 2>/dev/null | head -1) ;;
+            none)
+                echo -e "${YELLOW}No firewall found (firewalld / ufw).${NC}"
+                press_enter; return ;;
+        esac
+
+        echo -e "  Status: ${BOLD}${status_str}${NC}\n"
+        echo "  1) Enable firewall"
+        echo "  2) Disable firewall"
+        echo "  3) Open port"
+        echo "  4) Close port"
+        echo "  5) List firewall rules"
+        echo "  6) List listening ports"
+        echo "  0) Back"
+        echo -e "${YELLOW}Select:${NC} \c"
+        read -r _ch
+
+        case "$_ch" in
+            1) case "$fw" in
+                   firewalld) systemctl start firewalld && systemctl enable firewalld ;;
+                   ufw)       ufw --force enable ;;
+               esac
+               log_success "Firewall enabled." ;;
+
+            2) print_warning_box
+               echo -e "${RED}Disabling the firewall will leave this server unprotected!${NC}"
+               confirm_action "Still continue?" && {
+                   case "$fw" in
+                       firewalld) systemctl stop firewalld ;;
+                       ufw)       ufw disable ;;
+                   esac
+                   log_warn "Firewall disabled."
+               } || log_info "Cancelled." ;;
+
+            3) echo -e "${BOLD}Enter port to open (e.g. 8080):${NC} \c"
+               read -r _port
+               if ! validate_port "$_port"; then
+                   log_warn "Invalid port number."
+               else
+                   case "$fw" in
+                       firewalld) firewall-cmd --permanent --add-port="${_port}/tcp" && firewall-cmd --reload ;;
+                       ufw)       ufw allow "$_port"/tcp ;;
+                   esac
+                   # Allow port in SELinux if enforcing
+                   if command -v semanage &>/dev/null && getenforce 2>/dev/null | grep -qi enforcing; then
+                       semanage port -a -t http_port_t -p tcp "$_port" 2>/dev/null || \
+                       semanage port -m -t http_port_t -p tcp "$_port" 2>/dev/null || true
+                       log_info "SELinux: port $_port allowed for http_port_t."
+                   fi
+                   log_success "Port $_port opened."
+               fi ;;
+
+            4) echo -e "${BOLD}Enter port to close:${NC} \c"
+               read -r _port
+               if ! validate_port "$_port"; then
+                   log_warn "Invalid port number."
+               else
+                   print_warning_box
+                   echo -e "${RED}Closing port $_port may disrupt running services!${NC}"
+                   confirm_action "Continue closing port $_port?" && {
+                       case "$fw" in
+                           firewalld) firewall-cmd --permanent --remove-port="${_port}/tcp" && firewall-cmd --reload ;;
+                           ufw)       ufw deny "$_port"/tcp ;;
+                       esac
+                       log_success "Port $_port closed."
+                   } || log_info "Cancelled."
+               fi ;;
+
+            5) case "$fw" in
+                   firewalld) firewall-cmd --list-all ;;
+                   ufw)       ufw status numbered ;;
+               esac
+               press_enter ;;
+
+            6) echo -e "\n${BOLD}Listening ports on this server:${NC}\n"
+               ss -tlnp 2>/dev/null | awk 'NR==1 || /LISTEN/' \
+                   || netstat -tlnp 2>/dev/null | grep LISTEN
+               press_enter ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+# =============================================================================
+# SECURITY MODULE — MALWARE SCAN (ClamAV)
+# =============================================================================
+malware_scan() {
+    print_section "MALWARE SCAN — ClamAV"
+
+    if ! command -v clamscan &>/dev/null; then
+        log_warn "ClamAV is not installed."
+        confirm_action "Install ClamAV now?" && {
+            case "$OS_FAMILY" in
+                rhel)   pkg_install clamav clamav-update ;;
+                debian) pkg_install clamav clamav-daemon ;;
+            esac
+            freshclam 2>/dev/null || true
+        } || return 1
+    fi
+
+    echo -e "${BOLD}Scan scope:${NC}"
+    echo "  1) Scan a specific domain"
+    echo "  2) Scan all of /home/web/"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"
+    read -r _ch
+
+    local scan_path=""
+    case "$_ch" in
+        1) _select_domain "Select site" || return
+           scan_path="$(get_site_dir "$SELECTED_DOMAIN")"
+           if [[ ! -d "$scan_path" ]]; then
+               log_error "Directory not found: $scan_path"; return 1
+           fi ;;
+        2) scan_path="/home/web" ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; return 1 ;;
+    esac
+
+    # Update virus definitions
+    echo -e "${YELLOW}Updating virus database...${NC}"
+    freshclam --quiet 2>/dev/null || true
+
+    local log_path="/var/log/clamav/scan_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "$(dirname "$log_path")"
+
+    echo -e "${BOLD}Scanning: ${BOLD}${scan_path}${NC}"
+    echo -e "${DIM}(Full log: $log_path)${NC}\n"
+
+    # clamscan returns 1 if infected (not an error)
+    clamscan -r --infected --log="$log_path" "$scan_path" 2>&1 | tail -30 || true
+
+    local infected
+    infected=$(grep -oP '(?<=Infected files: )\d+' "$log_path" 2>/dev/null || echo "?")
+    echo ""
+    echo -e "  ${BOLD}Infected files found: ${infected}${NC}"
+    echo -e "  Full log: $log_path"
+    press_enter
+}
+
+# =============================================================================
+# SECURITY MODULE — FAIL2BAN
+# =============================================================================
+manage_fail2ban() {
+    print_section "FAIL2BAN MANAGEMENT"
+
+    if ! command -v fail2ban-client &>/dev/null; then
+        log_warn "Fail2ban is not installed."
+        confirm_action "Install Fail2ban now?" && {
+            pkg_install fail2ban
+            systemctl enable fail2ban && systemctl start fail2ban
+            log_success "Fail2ban installed and running."
+        } || return
+    fi
+
+    while true; do
+        local status; status=$(systemctl is-active fail2ban 2>/dev/null || echo "unknown")
+        echo -e "\n  Status: ${BOLD}${status}${NC}\n"
+        echo "  1) Enable Fail2ban"
+        echo "  2) Disable Fail2ban"
+        echo "  3) Show detailed status"
+        echo "  4) List banned IPs"
+        echo "  5) Unban an IP"
+        echo "  0) Back"
+        echo -e "${YELLOW}Select:${NC} \c"
+        read -r _ch
+        case "$_ch" in
+            1) systemctl start fail2ban && systemctl enable fail2ban
+               log_success "Fail2ban enabled." ;;
+            2) print_warning_box
+               confirm_action "Disable Fail2ban?" && {
+                   systemctl stop fail2ban; log_warn "Fail2ban disabled."
+               } || log_info "Cancelled." ;;
+            3) fail2ban-client status; press_enter ;;
+            4) fail2ban-client status sshd 2>/dev/null || fail2ban-client status
+               press_enter ;;
+            5) echo -e "${BOLD}Enter IP to unban:${NC} \c"
+               read -r _ip
+               fail2ban-client set sshd unbanip "$_ip" \
+                   && log_success "IP $_ip unbanned." \
+                   || log_error "Failed to unban $_ip."
+               press_enter ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fix_permissions() {
+    print_section "FIX PERMISSIONS"
+    echo "  1) All sites + phpMyAdmin"
+    echo "  2) Select a site"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _fopt
+    case "$_fopt" in
+        1)
+            local _count=0
+            for _mf in "${SITES_META_DIR}"/*.conf; do
+                [[ -f "$_mf" ]] || continue
+                local _dom; _dom=$(basename "$_mf" .conf)
+                local _usr; _usr=$(grep "^WEB_USER=" "$_mf" | cut -d= -f2)
+                local _dir; _dir="$(get_site_dir "$_dom")"
+                if [[ -n "$_usr" && -d "$_dir" ]]; then
+                    _set_site_perms "$_dir" "$_usr"
+                    log_success "Fixed: ${_dom} (${_usr})"
+                    ((_count++)) || true
+                fi
+            done
+            # phpMyAdmin
+            if [[ -d /var/www/phpmyadmin ]] && [[ -f "${CONFIG_DIR}/pma_user" ]]; then
+                local _pu; _pu=$(cat "${CONFIG_DIR}/pma_user")
+                if [[ -n "$_pu" ]]; then
+                    _set_site_perms /var/www/phpmyadmin "$_pu"
+                    log_success "Fixed: phpMyAdmin (${_pu})"
+                    ((_count++)) || true
+                fi
+            fi
+            echo ""
+            log_success "Done — ${_count} site(s) fixed."
+            ;;
+        2)
+            echo ""
+            # Build list: all sites + phpMyAdmin option
+            local -a _choices=()
+            for _mf in "${SITES_META_DIR}"/*.conf; do
+                [[ -f "$_mf" ]] || continue
+                _choices+=("$(basename "$_mf" .conf)")
+            done
+            [[ -d /var/www/phpmyadmin ]] && _choices+=("phpMyAdmin")
+            [[ ${#_choices[@]} -eq 0 ]] && { log_warn "No sites found."; press_enter; return; }
+            local i=1
+            for _c in "${_choices[@]}"; do printf "  %2d) %s\n" "$i" "$_c"; ((i++)) || true; done
+            echo "   0) Cancel"
+            echo -ne "\n  Select [1-$((i-1))]: "; read -r _sel
+            [[ "$_sel" == "0" || -z "$_sel" ]] && return
+            local _picked="${_choices[$((${_sel}-1))]}"
+            if [[ "$_picked" == "phpMyAdmin" ]]; then
+                if [[ -f "${CONFIG_DIR}/pma_user" ]]; then
+                    local _pu; _pu=$(cat "${CONFIG_DIR}/pma_user")
+                    _set_site_perms /var/www/phpmyadmin "$_pu"
+                    log_success "Fixed: phpMyAdmin (${_pu})"
+                else
+                    log_warn "phpMyAdmin user not found."
+                fi
+            else
+                local _usr; _usr=$(grep "^WEB_USER=" "${SITES_META_DIR}/${_picked}.conf" | cut -d= -f2)
+                local _dir; _dir="$(get_site_dir "$_picked")"
+                if [[ -n "$_usr" && -d "$_dir" ]]; then
+                    _set_site_perms "$_dir" "$_usr"
+                    log_success "Fixed: ${_picked} (${_usr})"
+                else
+                    log_warn "Web user or directory not found for ${_picked}."
+                fi
+            fi
+            ;;
+        0) return ;;
+        *) log_warn "Invalid selection." ;;
+    esac
+    press_enter
+}
+
+manage_security() {
+    while true; do
+        print_section "SECURITY"
+        echo "  1) Firewall management"
+        echo "  2) Malware scan (ClamAV)"
+        echo "  3) Fail2ban management"
+        echo "  4) Fix permissions"
+        echo "  0) Back"
+        echo -e "${YELLOW}Select:${NC} \c"
+        read -r _ch
+        case "$_ch" in
+            1) manage_firewall ;;
+            2) malware_scan ;;
+            3) manage_fail2ban ;;
+            4) fix_permissions ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+# =============================================================================
+# BACKUP MODULE
+# =============================================================================
+backup_website() {
+    print_section "BACKUP WEBSITE"
+    _select_domain "Select site to backup" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+
+    local site_dir; site_dir="$(get_site_dir "$domain")"
+    [[ ! -d "$site_dir" ]] && { log_error "Directory not found: $site_dir"; return 1; }
+
+    echo -e "\n${BOLD}Backup type:${NC}"
+    echo "  1) Files + Database"
+    echo "  2) Files only"
+    echo "  3) Database only"
+    local _btype
+    echo -e "${YELLOW}Select [1-3]:${NC} \c"; read -r _btype
+    [[ "$_btype" =~ ^[1-3]$ ]] || _btype=1
+
+    local ts; ts=$(date +%Y%m%d_%H%M%S)
+    local bdir; bdir="$(get_backup_dir "$domain")"
+    mkdir -p "$bdir"
+
+    # Backup site files
+    if [[ "$_btype" == "1" || "$_btype" == "2" ]]; then
+        local code_bk="${bdir}/code_${ts}.tar.gz"
+        log_info "Backing up files → $code_bk"
+        tar -czf "$code_bk" -C "$(dirname "$site_dir")" "$(basename "$site_dir")" \
+            && log_success "Files backup OK." \
+            || log_error "Files backup failed."
+    fi
+
+    # Backup database
+    if [[ "$_btype" == "1" || "$_btype" == "3" ]]; then
+        if [[ -f "$DB_LIST_FILE" ]]; then
+            local db_line
+            db_line=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null || true)
+            if [[ -n "$db_line" ]]; then
+                local _db_name _db_user _enc _type _pass
+                IFS='|' read -r _ _db_name _db_user _enc _type <<< "$db_line"
+                _pass=$(decrypt_pass "$_enc" 2>/dev/null || echo "")
+                local db_bk="${bdir}/db_${ts}.sql.gz"
+                log_info "Backing up database → $db_bk"
+                case "$_type" in
+                    mysql|mariadb)
+                        mysqldump -u "$_db_user" -p"${_pass}" "$_db_name" 2>/dev/null \
+                            | gzip > "$db_bk" \
+                            && log_success "Database backup OK." \
+                            || log_warn "Database backup failed."
+                        ;;
+                    postgresql)
+                        sudo -u postgres pg_dump "$_db_name" 2>/dev/null \
+                            | gzip > "$db_bk" \
+                            && log_success "PostgreSQL backup OK." \
+                            || log_warn "PostgreSQL backup failed."
+                        ;;
+                esac
+            else
+                log_warn "No database found for ${domain}."
+            fi
+        fi
+    fi
+
+    echo ""
+    log_success "Backup complete → ${bdir}"
+    ls -lh "$bdir" | grep "${ts}" || true
+    press_enter
+}
+
+restore_backup() {
+    print_section "RESTORE BACKUP"
+
+    echo -e "${BOLD}Enter domain to restore:${NC} \c"
+    read -r domain
+    [[ -z "$domain" ]] && return 0
+
+    local bdir; bdir="$(get_backup_dir "$domain")"
+    [[ ! -d "$bdir" ]] && { log_error "No backup found for: $domain"; press_enter; return 1; }
+
+    echo -e "${BOLD}Available backups:${NC}"
+    ls -lt "$bdir"
+
+    confirm_danger "Restore backup for ${domain} (OVERWRITES current data)" \
+        || { log_info "Cancelled."; return 0; }
+
+    # Restore files
+    local latest_code
+    latest_code=$(ls -1t "${bdir}"/code_*.tar.gz 2>/dev/null | head -1 || true)
+    if [[ -n "$latest_code" ]]; then
+        local site_dir; site_dir="$(get_site_dir "$domain")"
+        log_info "Restoring files from: $latest_code"
+        rm -rf "${site_dir:?}"
+        mkdir -p "$(dirname "$site_dir")"
+        tar -xzf "$latest_code" -C "$(dirname "$site_dir")" \
+            && log_success "Files restored." \
+            || log_error "File restore failed."
+    fi
+
+    # Restore database
+    local latest_db
+    latest_db=$(ls -1t "${bdir}"/db_*.sql.gz 2>/dev/null | head -1 || true)
+    if [[ -n "$latest_db" && -f "$DB_LIST_FILE" ]]; then
+        local db_line
+        db_line=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null || true)
+        if [[ -n "$db_line" ]]; then
+            local _db_name _db_user _enc _type _pass
+            IFS='|' read -r _ _db_name _db_user _enc _type <<< "$db_line"
+            _pass=$(decrypt_pass "$_enc" 2>/dev/null || echo "")
+            log_info "Restoring database from: $latest_db"
+            case "$_type" in
+                mysql|mariadb)
+                    zcat "$latest_db" | mysql -u "$_db_user" -p"${_pass}" "$_db_name" \
+                        && log_success "Database restored." \
+                        || log_error "Database restore failed."
+                    ;;
+            esac
+        fi
+    fi
+
+    log_success "Restore complete!"
+    press_enter
+}
+
+# =============================================================================
+# PHP MANAGER MODULE
+# =============================================================================
+manage_php() {
+    while true; do
+        print_section "PHP MANAGER"
+
+        local vers_str; vers_str=$(get_php_versions)
+        echo -e "${BOLD}Installed PHP versions:${NC}"
+        if [[ -z "$vers_str" ]]; then
+            echo -e "  ${YELLOW}(none)${NC}"
+        else
+            local -a vers; read -ra vers <<< "$vers_str"
+            for v in "${vers[@]}"; do
+                [[ -z "$v" ]] && continue
+                local svc; svc=$(get_php_service "$v")
+                local st; st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+                local color="$NC"
+                [[ "$st" == "active" ]] && color="$GREEN"
+                [[ "$st" != "active" ]] && color="$YELLOW"
+                echo -e "  PHP $v — ${color}${st}${NC}"
+            done
+        fi
+        echo ""
+        echo "  1) Install PHP version"
+        echo "  2) Remove PHP version"
+        echo "  3) Restart PHP-FPM"
+        echo "  4) Show PHP info"
+        echo "  0) Back"
+        echo -e "${YELLOW}Select:${NC} \c"
+        read -r _ch
+        case "$_ch" in
+            1) install_php_version ;;
+            2) remove_php_version ;;
+            3) local _vs; _vs=$(get_php_versions)
+               if [[ -z "$_vs" ]]; then log_warn "No PHP-FPM found."; press_enter
+               else
+                   local -a vs; read -ra vs <<< "$_vs"
+                   for v in "${vs[@]}"; do
+                       [[ -z "$v" ]] && continue
+                       local svc; svc=$(get_php_service "$v")
+                       systemctl restart "$svc" && log_success "PHP $v restarted." || log_warn "Failed to restart PHP $v."
+                   done
+                   press_enter
+               fi ;;
+            4) local _vs; _vs=$(get_php_versions)
+               if [[ -z "$_vs" ]]; then log_warn "No PHP-FPM found."; press_enter
+               else
+                   local -a vs; read -ra vs <<< "$_vs"
+                   for v in "${vs[@]}"; do
+                       [[ -z "$v" ]] && continue
+                       local svc; svc=$(get_php_service "$v")
+                       local st; st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+                       echo -e "\n  ${BOLD}PHP $v${NC}"
+                       echo -e "    Service : $svc ($st)"
+                       echo -e "    Socket  : $(get_php_socket "$v")"
+                   done
+                   press_enter
+               fi ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+install_php_version() {
+    local -a avail_vers=("5.6" "7.4" "8.0" "8.1" "8.2" "8.3")
+    echo -e "\n${BOLD}Select PHP version to install:${NC}"
+    local i=1
+    for v in "${avail_vers[@]}"; do
+        if [[ "$v" == "5.6" ]]; then
+            echo "  $i) PHP $v  ${RED}(EOL — legacy use only)${NC}"
+        else
+            echo "  $i) PHP $v"
+        fi
+        ((i++)) || true
+    done
+
+    echo -e "${YELLOW}Select [1-${#avail_vers[@]}]:${NC} \c"
+    read -r _ch
+
+    if [[ ! "$_ch" =~ ^[0-9]+$ ]] || [[ "$_ch" -lt 1 ]] || [[ "$_ch" -gt ${#avail_vers[@]} ]]; then
+        log_warn "Invalid selection."; return 1
+    fi
+    local ver="${avail_vers[$((${_ch}-1))]}"
+    [[ "$ver" == "5.6" ]] && log_warn "PHP 5.6 is EOL since 2018. Installing anyway..."
+
+    case "$OS_FAMILY" in
+        rhel)
+            if ! dnf repolist 2>/dev/null | grep -qi remi; then
+                log_info "Installing Remi repository..."
+                dnf install -y "https://rpms.remirepo.net/enterprise/remi-release-$(rpm -E %rhel).rpm" \
+                    || { log_error "Failed to install Remi repo."; return 1; }
+            fi
+            # Reset default PHP module stream to avoid conflicts with Remi
+            # RHEL 10+ uses DNF5 which dropped module streams
+            [[ "${OS_VERSION_ID}" -lt 10 ]] && dnf module reset php -y 2>/dev/null || true
+            ;;
+        debian)
+            if ! apt-cache show "php${ver}-fpm" &>/dev/null; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common
+                add-apt-repository -y ppa:ondrej/php
+                apt-get update -y
+            fi ;;
+    esac
+
+    local pkgs; pkgs=$(get_php_packages "$ver")
+    # shellcheck disable=SC2086
+    pkg_install $pkgs || { log_error "PHP $ver installation failed."; return 1; }
+
+    local svc; svc=$(get_php_service "$ver")
+    systemctl enable "$svc" && systemctl start "$svc"
+    _fix_fpm_socket_perms "$ver"
+    log_success "PHP $ver installed and running."
+    press_enter
+}
+
+remove_php_version() {
+    local vers_str; vers_str=$(get_php_versions)
+    [[ -z "$vers_str" ]] && { log_warn "No PHP versions installed."; return 0; }
+
+    local -a vers; read -ra vers <<< "$vers_str"
+    echo -e "${BOLD}Installed PHP versions:${NC}"
+    local i=1
+    for v in "${vers[@]}"; do echo "  $i) PHP $v"; ((i++)) || true; done
+
+    echo -e "${YELLOW}Select [1-${#vers[@]}]:${NC} \c"
+    read -r _ch
+
+    if [[ ! "$_ch" =~ ^[0-9]+$ ]] || [[ "$_ch" -lt 1 ]] || [[ "$_ch" -gt ${#vers[@]} ]]; then
+        log_warn "Invalid selection."; return 1
+    fi
+    local ver="${vers[$((${_ch}-1))]}"
+
+    print_warning_box
+    echo -e "${RED}Removing PHP $ver will break all websites currently using this version!${NC}"
+    confirm_danger "Remove PHP $ver" || { log_info "Cancelled."; return 0; }
+
+    local svc; svc=$(get_php_service "$ver")
+    systemctl stop "$svc" 2>/dev/null || true
+
+    case "$OS_FAMILY" in
+        rhel)
+            local vn="${ver//./}"
+            pkg_remove "php${vn}-php-fpm" ;;
+        debian)
+            pkg_remove "php${ver}-fpm" "php${ver}-cli" ;;
+    esac
+    log_success "PHP $ver removed."
+    press_enter
+}
+
+# =============================================================================
+# SYSTEM MODULE
+# =============================================================================
+
+# Returns a space-separated list of services present on this system
+_available_services() {
+    local -a svcs=()
+
+    # Nginx
+    systemctl list-units --type=service --no-legend 2>/dev/null | grep -q "nginx.service" && svcs+=("nginx")
+
+    # PHP-FPM
+    local vers_str; vers_str=$(get_php_versions)
+    if [[ -n "$vers_str" ]]; then
+        local -a vers; read -ra vers <<< "$vers_str"
+        for v in "${vers[@]}"; do
+            [[ -z "$v" ]] && continue
+            svcs+=("$(get_php_service "$v")")
+        done
+    fi
+
+    # Database services
+    for _svc in mysql mariadb mysqld postgresql postgresql-14 postgresql-15 postgresql-16; do
+        systemctl list-units --type=service --no-legend 2>/dev/null \
+            | grep -q "${_svc}.service" && svcs+=("$_svc")
+    done
+
+    # Cache services
+    for _svc in redis redis-server memcached; do
+        systemctl list-units --type=service --no-legend 2>/dev/null \
+            | grep -q "${_svc}.service" && svcs+=("$_svc")
+    done
+
+    echo "${svcs[*]:-}"
+}
+
+_select_service() {
+    local svcs_str; svcs_str=$(_available_services)
+    [[ -z "$svcs_str" ]] && { log_warn "No services found."; return 1; }
+
+    local -a svcs; read -ra svcs <<< "$svcs_str"
+    echo -e "\n${BOLD}Available services:${NC}"
+    local i=1
+    for s in "${svcs[@]}"; do
+        local st; st=$(systemctl is-active "$s" 2>/dev/null || echo "unknown")
+        echo "  $i) $s  ($st)"
+        ((i++)) || true
+    done
+
+    echo -e "${YELLOW}Select service [1-${#svcs[@]}]:${NC} \c"
+    read -r _ch
+
+    if [[ ! "$_ch" =~ ^[0-9]+$ ]] || [[ "$_ch" -lt 1 ]] || [[ "$_ch" -gt ${#svcs[@]} ]]; then
+        log_warn "Invalid selection."; return 1
+    fi
+    SELECTED_SERVICE="${svcs[$((${_ch}-1))]}"
+    return 0
+}
+
+service_control() {
+    local action="$1"
+    print_section "SERVICE: ${action^^}"
+
+    SELECTED_SERVICE=""
+    _select_service || { press_enter; return 1; }
+    local svc="$SELECTED_SERVICE"
+
+    # Warn for potentially disruptive actions
+    if [[ "$action" == "stop" || "$action" == "disable" ]]; then
+        print_warning_box
+        echo -e "${RED}${action^^} service '${svc}' may disrupt running sites!${NC}"
+        confirm_action "Continue anyway?" || { log_info "Cancelled."; return 0; }
+    fi
+
+    systemctl "$action" "$svc" \
+        && log_success "${action^} ${svc}: OK" \
+        || log_error "Failed to ${action} ${svc}"
+    press_enter
+}
+
+show_status() {
+    print_section "SERVICE STATUS"
+    local svcs_str; svcs_str=$(_available_services)
+    [[ -z "$svcs_str" ]] && { log_warn "No services found."; press_enter; return; }
+
+    local -a svcs; read -ra svcs <<< "$svcs_str"
+    printf "\n  ${BOLD}%-35s %s${NC}\n" "SERVICE" "STATUS"
+    separator
+    for s in "${svcs[@]}"; do
+        local st; st=$(systemctl is-active "$s" 2>/dev/null || echo "unknown")
+        local color="$NC"
+        [[ "$st" == "active" ]]   && color="$GREEN"
+        [[ "$st" == "inactive" ]] && color="$YELLOW"
+        [[ "$st" == "failed" ]]   && color="$RED"
+        printf "  %-35s ${color}%s${NC}\n" "$s" "$st"
+    done
+    separator
+    press_enter
+}
+
+install_extra_service() {
+    print_section "INSTALL EXTRA SERVICE"
+    echo "  1) Redis"
+    echo "  2) Memcached"
+    echo "  3) PostgreSQL"
+    echo "  4) Fail2ban"
+    echo "  5) ClamAV"
+    echo "  6) Certbot (SSL Let's Encrypt)"
+    echo "  7) Git"
+    echo "  8) phpMyAdmin"
+    echo "  9) MariaDB 11.4"
+    echo "  0) Back"
+    echo -e "${YELLOW}Select:${NC} \c"
+    read -r _ch
+
+    case "$_ch" in
+        1) case "$OS_FAMILY" in
+               rhel)   pkg_install redis ;;
+               debian) pkg_install redis-server ;;
+           esac
+           local rsvc="redis"; [[ "$OS_FAMILY" == "debian" ]] && rsvc="redis-server"
+           systemctl enable "$rsvc" && systemctl start "$rsvc"
+           log_success "Redis installed." ;;
+        2) pkg_install memcached libmemcached-tools
+           case "$OS_FAMILY" in
+               rhel)   pkg_install php-pecl-memcached 2>/dev/null || true ;;
+               debian) pkg_install php-memcached 2>/dev/null || true ;;
+           esac
+           systemctl enable memcached && systemctl start memcached
+           log_success "Memcached installed." ;;
+        3) case "$OS_FAMILY" in
+               rhel)   pkg_install postgresql-server postgresql-contrib
+                       postgresql-setup --initdb 2>/dev/null || true ;;
+               debian) pkg_install postgresql postgresql-contrib ;;
+           esac
+           systemctl enable postgresql && systemctl start postgresql
+           log_success "PostgreSQL installed." ;;
+        4) pkg_install fail2ban
+           systemctl enable fail2ban && systemctl start fail2ban
+           log_success "Fail2ban installed." ;;
+        5) case "$OS_FAMILY" in
+               rhel)   pkg_install clamav clamav-update ;;
+               debian) pkg_install clamav clamav-daemon ;;
+           esac
+           freshclam 2>/dev/null || true
+           log_success "ClamAV installed." ;;
+        6) pkg_install certbot python3-certbot-nginx
+           log_success "Certbot installed." ;;
+        7) pkg_install git
+           log_success "Git installed." ;;
+        8) if [[ -d /var/www/phpmyadmin ]]; then
+               echo -e "${YELLOW}phpMyAdmin is already installed. This will reinstall and generate a new secret path.${NC}"
+               confirm_action "Continue?" || { log_info "Cancelled."; press_enter; continue; }
+           fi
+           install_phpmyadmin ;;
+        9) if command -v mysql &>/dev/null || command -v mariadb &>/dev/null; then
+               print_warning_box
+               echo -e "${YELLOW}MariaDB is already installed on this server.${NC}"
+               echo -e "Reinstalling will NOT delete existing databases, but may cause service interruption."
+               confirm_action "Continue anyway?" || { log_info "Cancelled."; press_enter; continue; }
+           fi
+           install_mariadb ;;
+        0) return ;;
+        *) log_warn "Invalid selection." ;;
+    esac
+    press_enter
+}
+
+# =============================================================================
+# UPDATE MODULE
+# =============================================================================
+show_version() {
+    echo -e "\n  ${BOLD}Liuer Panel${NC} — version ${GREEN}${VERSION}${NC}"
+    echo -e "  Script  : ${INSTALL_DIR}/${SCRIPT_NAME}"
+    echo -e "  Command : ${BIN_LINK}"
+    echo -e "  OS      : ${OS_ID} ${OS_VERSION_ID} (${OS_FAMILY})"
+    echo ""
+}
+
+check_update() {
+    print_section "CHECK FOR UPDATES"
+
+    local api_url="https://api.github.com/repos/liuer-net/liuer-panel/contents/${SCRIPT_NAME}"
+    log_info "Fetching remote version..."
+    local remote_ver
+    remote_ver=$(curl -fsSL -H "Accept: application/vnd.github.raw" "$api_url" 2>/dev/null \
+                 | grep -oP '(?<=readonly VERSION=")[^"]+' | head -1 || true)
+
+    if [[ -z "$remote_ver" ]]; then
+        log_error "Cannot reach GitHub. Check your internet connection."
+        press_enter; return 1
+    fi
+
+    if [[ "$remote_ver" == "$VERSION" ]]; then
+        log_success "You are running the latest version (v${VERSION})."
+    else
+        echo -e "${YELLOW}New version available: ${BOLD}v${remote_ver}${NC}  (current: v${VERSION})"
+        echo -e "Run 'liuer update' to upgrade."
+    fi
+    press_enter
+}
+
+update_tool() {
+    print_section "UPDATE LIUER PANEL"
+
+    local api_url="https://api.github.com/repos/liuer-net/liuer-panel/contents/${SCRIPT_NAME}"
+    local target="${INSTALL_DIR}/${SCRIPT_NAME}"
+
+    log_info "Fetching remote version..."
+    local remote_ver
+    remote_ver=$(curl -fsSL -H "Accept: application/vnd.github.raw" "$api_url" 2>/dev/null \
+                 | grep -oP '(?<=readonly VERSION=")[^"]+' | head -1 || true)
+
+    if [[ -z "$remote_ver" ]]; then
+        log_error "Cannot reach GitHub. Check your internet connection."
+        press_enter; return 1
+    fi
+
+    if [[ "$remote_ver" == "$VERSION" ]]; then
+        log_success "Already up to date (v${VERSION})."
+        press_enter; return 0
+    fi
+
+    echo -e "${BOLD}Updating: ${BOLD}v${VERSION}${NC}${BOLD} → ${BOLD}v${remote_ver}${NC}\n"
+    confirm_action "Proceed with update?" || { log_info "Cancelled."; return 0; }
+
+    local backup_path="/tmp/liuer-panel-backup-$(date +%Y%m%d_%H%M%S).sh"
+    log_info "Backing up current script to: $backup_path"
+    cp "$target" "$backup_path" \
+        || { log_error "Backup failed. Aborting."; return 1; }
+
+    log_info "Downloading v${remote_ver}..."
+    if curl -fsSL -H "Accept: application/vnd.github.raw" "$api_url" -o "${target}.tmp" 2>/dev/null \
+       && [[ -s "${target}.tmp" ]]; then
+        mv "${target}.tmp" "$target"
+        chmod +x "$target"
+        ln -sf "$target" "$BIN_LINK"
+        rm -f "$backup_path"
+        log_success "Update successful! Now running v${remote_ver}."
+        log_info "Applying post-update system fixes..."
+        bash "$target" _repair_auto 2>/dev/null || true
+        echo ""
+        log_info "Restarting liuer with new version..."
+        sleep 1
+        exec "$BIN_LINK"
+    else
+        rm -f "${target}.tmp"
+        log_error "Download failed! Restoring backup..."
+        cp "$backup_path" "$target" \
+            && log_success "Rollback successful." \
+            || log_error "Rollback failed! Restore manually from: $backup_path"
+    fi
+    press_enter
+}
+
+do_repair() {
+    print_section "REPAIR SYSTEM"
+    log_info "Applying system fixes..."
+
+    # 0. Upgrade nginx to mainline if < 1.25
+    upgrade_nginx_mainline
+
+    # 1. Disable SELinux if enforcing (RHEL-family)
+    if command -v getenforce &>/dev/null && getenforce 2>/dev/null | grep -qi enforcing; then
+        setenforce 0
+        sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
+        log_success "SELinux disabled."
+    else
+        log_info "SELinux: not enforcing — skipped."
+    fi
+
+    # 2. Fix SELinux context for ACME webroot
+    local acme_root="/var/lib/letsencrypt/http_challenges"
+    if [[ -d "$acme_root" ]] && command -v chcon &>/dev/null; then
+        chcon -R -t httpd_sys_content_t "$acme_root" 2>/dev/null || true
+    fi
+    mkdir -p "$acme_root" && chmod 755 "$acme_root"
+
+    # 3. Open HTTP/HTTPS in firewall
+    _open_http_https
+
+    # 4. Fix nginx catch-all conflicts
+    rm -f /etc/nginx/conf.d/default.conf
+    rm -f /etc/nginx/sites-enabled/default
+
+    # 5. If Memcached is installed, ensure php-memcached extension is present
+    if systemctl is-active --quiet memcached 2>/dev/null; then
+        case "$OS_FAMILY" in
+            rhel)
+                php -m 2>/dev/null | grep -qi memcached || pkg_install php-pecl-memcached 2>/dev/null || true ;;
+            debian)
+                php -m 2>/dev/null | grep -qi memcached || \
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y php-memcached 2>/dev/null || true ;;
+        esac
+    fi
+
+    # 6. Disable default www.conf pool for all PHP versions
+    _disable_default_fpm_pools
+
+    # 7. Re-apply permissions for all sites
+    for _mf in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$_mf" ]] || continue
+        local _rdom; _rdom=$(basename "$_mf" .conf)
+        local _rusr; _rusr=$(grep "^WEB_USER=" "$_mf" | cut -d= -f2)
+        local _rdir; _rdir="$(get_site_dir "$_rdom")"
+        [[ -n "$_rusr" && -d "$_rdir" ]] && _set_site_perms "$_rdir" "$_rusr" || true
+    done
+    if [[ -d /var/www/phpmyadmin ]] && [[ -f "${CONFIG_DIR}/pma_user" ]]; then
+        local _pma_u; _pma_u=$(cat "${CONFIG_DIR}/pma_user")
+        [[ -n "$_pma_u" ]] && _set_site_perms /var/www/phpmyadmin "$_pma_u" || true
+    fi
+
+    # 8. Reload nginx
+    if nginx -t &>/dev/null; then
+        nginx -s reload && log_success "Nginx reloaded." || true
+    else
+        log_warn "Nginx config has errors — not reloaded."
+    fi
+
+    # Re-apply motd hint (keeps it in sync after updates)
+    setup_motd
+
+    log_success "Repair complete."
+}
+
+update_system_packages() {
+    print_section "SYSTEM UPDATE"
+    print_warning_box
+    echo -e "${YELLOW}Upgrading all packages may require a server reboot!${NC}"
+    confirm_action "Continue?" || return 0
+    log_info "Updating system packages..."
+    pkg_update_all && log_success "System update complete." \
+                   || log_error "System update failed."
+    press_enter
+}
+
+update_service() {
+    print_section "UPDATE SERVICE"
+    echo "  1) Nginx"
+    echo "  2) PHP (all installed versions)"
+    echo "  3) MySQL / MariaDB"
+    echo "  4) Redis"
+    echo "  5) Memcached"
+    echo "  0) Back"
+    echo -e "${YELLOW}Select:${NC} \c"
+    read -r _ch
+
+    case "$_ch" in
+        1) pkg_update_single nginx
+           nginx -t &>/dev/null && systemctl reload nginx
+           log_success "Nginx updated." ;;
+        2) local vers_str; vers_str=$(get_php_versions)
+           [[ -z "$vers_str" ]] && { log_warn "No PHP versions found."; press_enter; return; }
+           local -a vers; read -ra vers <<< "$vers_str"
+           for v in "${vers[@]}"; do
+               [[ -z "$v" ]] && continue
+               case "$OS_FAMILY" in
+                   rhel)   local vn="${v//./}"; dnf update -y "php${vn}-*" 2>/dev/null || true ;;
+                   debian) apt-get install --only-upgrade -y "php${v}-*" 2>/dev/null || true ;;
+               esac
+               systemctl restart "$(get_php_service "$v")"
+               log_success "PHP $v updated."
+           done ;;
+        3) case "$OS_FAMILY" in
+               rhel)   dnf update -y mariadb-server mysql-server 2>/dev/null || true ;;
+               debian) apt-get install --only-upgrade -y mariadb-server mysql-server 2>/dev/null || true ;;
+           esac
+           log_success "MySQL/MariaDB updated." ;;
+        4) case "$OS_FAMILY" in
+               rhel)   dnf update -y redis ;;
+               debian) apt-get install --only-upgrade -y redis-server ;;
+           esac
+           log_success "Redis updated." ;;
+        5) case "$OS_FAMILY" in
+               rhel)   dnf update -y memcached ;;
+               debian) apt-get install --only-upgrade -y memcached ;;
+           esac
+           log_success "Memcached updated." ;;
+        0) return ;;
+        *) log_warn "Invalid selection." ;;
+    esac
+    press_enter
+}
+
+manage_updates() {
+    while true; do
+        print_section "UPDATE MANAGEMENT"
+        echo "  1) Update Liuer Panel tool"
+        echo "  2) Check for new version"
+        echo "  3) Update all system packages"
+        echo "  4) Update individual service"
+        echo "  0) Back"
+        echo -e "${YELLOW}Select:${NC} \c"
+        read -r _ch
+        case "$_ch" in
+            1) update_tool ;;
+            2) check_update ;;
+            3) update_system_packages ;;
+            4) update_service ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+# =============================================================================
+# INSTALL MODULE
+# =============================================================================
+install_mariadb() {
+    log_info "Adding MariaDB 11.4 official repository..."
+    if curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
+        | bash -s -- --mariadb-server-version="mariadb-11.4" --skip-key-import=false 2>/dev/null; then
+        log_success "MariaDB 11.4 repo added"
+        if [[ "$OS_FAMILY" == "rhel" ]] && [[ "${OS_VERSION_ID}" -ge 10 ]]; then
+            dnf config-manager --set-disabled mariadb-maxscale 2>/dev/null || true
+        fi
+    else
+        log_warn "Failed to add MariaDB repo, falling back to OS default repo."
+    fi
+    log_info "Installing MariaDB 11.4..."
+    case "$OS_FAMILY" in
+        rhel)   pkg_install MariaDB-server MariaDB-client ;;
+        debian) pkg_install mariadb-server mariadb-client ;;
+    esac
+    local _maria_svc="mariadb"
+    systemctl list-unit-files 2>/dev/null | grep -q "^mysqld" && _maria_svc="mysqld"
+    systemctl enable "$_maria_svc" && systemctl start "$_maria_svc"
+    mysql -u root -e "DELETE FROM mysql.user WHERE User='';" 2>/dev/null || true
+    mysql -u root -e "DROP DATABASE IF EXISTS test;" 2>/dev/null || true
+    mysql -u root -e "FLUSH PRIVILEGES;" 2>/dev/null || true
+    log_success "MariaDB OK"
+
+    # jemalloc
+    local _jemalloc_lib=""
+    case "$OS_FAMILY" in
+        rhel)   pkg_install jemalloc 2>/dev/null || true
+                _jemalloc_lib=$(ldconfig -p 2>/dev/null | awk '/libjemalloc\.so\./{print $NF}' | head -1) ;;
+        debian) pkg_install libjemalloc2 2>/dev/null || true
+                _jemalloc_lib=$(ldconfig -p 2>/dev/null | awk '/libjemalloc\.so\./{print $NF}' | head -1) ;;
+    esac
+    if [[ -n "$_jemalloc_lib" ]]; then
+        mkdir -p "/etc/systemd/system/${_maria_svc}.service.d"
+        cat > "/etc/systemd/system/${_maria_svc}.service.d/jemalloc.conf" <<EOF
+[Service]
+Environment="LD_PRELOAD=${_jemalloc_lib}"
+EOF
+        systemctl daemon-reload
+        systemctl restart "$_maria_svc"
+        log_success "jemalloc enabled for MariaDB."
+    fi
+}
+
+install_phpmyadmin() {
+    log_info "Installing phpMyAdmin..."
+    mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+
+    # Fetch latest version from GitHub API
+    local pma_ver
+    pma_ver=$(curl -fsSL "https://api.github.com/repos/phpmyadmin/phpmyadmin/releases/latest" \
+              2>/dev/null | grep -oP '(?<="tag_name": "RELEASE_)[^"]+' | head -1 || true)
+
+    if [[ -z "$pma_ver" ]]; then
+        pma_ver="5.2.1"
+        log_warn "Could not fetch latest version, using fallback: ${pma_ver}"
+    else
+        pma_ver="${pma_ver//_/.}"
+        log_info "phpMyAdmin latest version: ${pma_ver}"
+    fi
+
+    local pma_url="https://files.phpmyadmin.net/phpMyAdmin/${pma_ver}/phpMyAdmin-${pma_ver}-all-languages.tar.gz"
+
+    curl -fsSL "$pma_url" | tar -xz -C /var/www/ 2>/dev/null \
+        || { log_warn "phpMyAdmin download failed."; return 1; }
+    [[ -d "/var/www/phpMyAdmin-${pma_ver}-all-languages" ]] \
+        && mv "/var/www/phpMyAdmin-${pma_ver}-all-languages" /var/www/phpmyadmin
+
+    local secret; secret=$(rand_str 32)
+
+    # Create a dedicated MySQL user for phpMyAdmin (password auth, avoids unix_socket issue)
+    local pma_db_user="pma_$(rand_str 8)"
+    local pma_db_pass; pma_db_pass=$(rand_str 20)
+    mysql -u root 2>/dev/null <<SQL
+CREATE USER IF NOT EXISTS '${pma_db_user}'@'localhost' IDENTIFIED BY '${pma_db_pass}';
+GRANT ALL PRIVILEGES ON *.* TO '${pma_db_user}'@'localhost' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+SQL
+    echo "${pma_db_user}|$(encrypt_pass "$pma_db_pass")" > "${CONFIG_DIR}/pma_db_user"
+    chmod 600 "${CONFIG_DIR}/pma_db_user"
+
+    mkdir -p /var/www/phpmyadmin/tmp
+    cat > /var/www/phpmyadmin/config.inc.php <<PHP
+<?php
+\$cfg['blowfish_secret'] = '${secret}';
+\$cfg['TempDir'] = '/var/www/phpmyadmin/tmp/';
+\$i = 0;
+\$i++;
+\$cfg['Servers'][\$i]['host']            = '127.0.0.1';
+\$cfg['Servers'][\$i]['auth_type']       = 'cookie';
+\$cfg['Servers'][\$i]['AllowNoPassword'] = false;
+PHP
+
+    # Ensure required PHP extensions are installed
+    case "$OS_FAMILY" in
+        debian) pkg_install php-mbstring php-zip php-gd php-curl 2>/dev/null || true ;;
+        rhel)   pkg_install php-mbstring php-zip php-gd php-curl 2>/dev/null || true ;;
+    esac
+
+    # Create dedicated system user (random name) for phpMyAdmin PHP-FPM pool
+    SELECTED_WEB_USER=""
+    _auto_create_web_user || { log_warn "Failed to create web user for phpMyAdmin."; return 1; }
+    local pma_sys_user="$SELECTED_WEB_USER"
+    echo "$pma_sys_user" > "${CONFIG_DIR}/pma_user"
+    chmod 600 "${CONFIG_DIR}/pma_user"
+
+    # Create dedicated PHP-FPM pool
+    create_php_pool "8.2" "phpmyadmin" "$pma_sys_user" 1 "/var/www/phpmyadmin"
+    local php_socket; php_socket=$(get_php_pool_socket "8.2" "phpmyadmin")
+
+    # Generate a secret path token and save it
+    local pma_token; pma_token="pma_$(rand_str 12)"
+    echo "$pma_token" > "${CONFIG_DIR}/pma_path"
+    chmod 600 "${CONFIG_DIR}/pma_path"
+
+    _set_site_perms /var/www/phpmyadmin "$pma_sys_user"
+    chmod 750 /var/www/phpmyadmin/tmp
+
+    # Remove known conflicting default nginx configs
+    rm -f /etc/nginx/conf.d/default.conf
+    rm -f /etc/nginx/sites-enabled/default
+
+    # Add secret path location to default nginx server (public-facing, no extra port)
+    cat > "${NGINX_CONF_DIR}/phpmyadmin.conf" <<EOF
+# phpMyAdmin — secret path access (no extra port needed)
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name "";
+
+    location /${pma_token}/ {
+        alias /var/www/phpmyadmin/;
+        index index.php;
+
+        location ~ \.php$ {
+            fastcgi_pass unix:${php_socket};
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME \$request_filename;
+            include fastcgi_params;
+        }
+    }
+}
+EOF
+    nginx -t &>/dev/null && nginx -s reload
+
+    local _ip; _ip=$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null \
+                     || curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
+                     || echo "SERVER_IP")
+    log_success "phpMyAdmin installed."
+    echo -e "  URL: ${BOLD}http://${_ip}/${pma_token}/${NC}"
+    echo -e "${DIM}Path saved to: ${CONFIG_DIR}/pma_path${NC}"
+}
+
+setup_motd() {
+    cat > /etc/profile.d/liuer-panel-hint.sh <<'EOF'
+printf "\n  ┌──────────────────────────────────────────────┐\n"
+printf "  │  Type  \033[1;36mliuer\033[0m  to manage your web server      │\n"
+printf "  └──────────────────────────────────────────────┘\n\n"
+EOF
+    chmod 644 /etc/profile.d/liuer-panel-hint.sh
+}
+
+do_install() {
+    print_header
+    echo -e "${BOLD}${BOLD}LIUER PANEL — INSTALLATION${NC}\n"
+
+    check_root
+    detect_os
+
+    echo -e "${BOLD}Operating system: ${BOLD}${OS_ID} ${OS_VERSION_ID} (${OS_FAMILY})${NC}\n"
+
+    # ── Disable SELinux on RHEL-family (causes persistent issues with nginx/certbot) ──
+    if [[ "$OS_FAMILY" == "rhel" ]] && command -v getenforce &>/dev/null; then
+        if getenforce 2>/dev/null | grep -qi "enforcing"; then
+            setenforce 0
+            sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
+            log_info "SELinux set to disabled (was: Enforcing)."
+        fi
+    fi
+
+    # ── Update & base packages ────────────────────────────────────────────────
+    log_info "Updating package list..."
+    case "$OS_FAMILY" in
+        rhel)
+            dnf update -y
+            dnf install -y epel-release curl wget tar gzip openssl git ;;
+        debian)
+            apt-get update -y
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                curl wget tar gzip openssl git software-properties-common ;;
+    esac
+
+    # ── Nginx (mainline 1.25+ from nginx.org for HTTP/2 & HTTP/3 support) ────
+    log_info "Installing Nginx mainline..."
+    setup_nginx_repo
+    pkg_install nginx
+    # On Ubuntu/Debian, remove the default site to avoid default_server conflicts
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        rm -f /etc/nginx/sites-enabled/default
+    fi
+    systemctl enable nginx && systemctl start nginx
+    _open_http_https
+    log_success "Nginx OK"
+
+    # ── PHP repo setup ────────────────────────────────────────────────────────
+    log_info "Installing PHP 8.2 (default)..."
+    case "$OS_FAMILY" in
+        rhel)
+            if ! dnf repolist 2>/dev/null | grep -qi remi; then
+                dnf install -y \
+                    "https://rpms.remirepo.net/enterprise/remi-release-$(rpm -E %rhel).rpm" \
+                    2>/dev/null || log_warn "Remi repo install failed — PHP packages may be missing."
+            fi
+            # Reset default PHP module stream to avoid conflicts with Remi
+            # RHEL 10+ uses DNF5 which dropped module streams
+            [[ "${OS_VERSION_ID}" -lt 10 ]] && dnf module reset php -y 2>/dev/null || true
+            ;;
+        debian)
+            add-apt-repository -y ppa:ondrej/php
+            apt-get update -y ;;
+    esac
+
+    local php_pkgs; php_pkgs=$(get_php_packages "8.2")
+    # shellcheck disable=SC2086
+    pkg_install $php_pkgs
+    local php82_svc; php82_svc=$(get_php_service "8.2")
+    systemctl enable "$php82_svc" && systemctl start "$php82_svc"
+    _fix_fpm_socket_perms "8.2"
+    log_success "PHP 8.2 OK"
+
+    # ── MariaDB 11.4 ──────────────────────────────────────────────────────────
+    install_mariadb
+
+    # ── Certbot ───────────────────────────────────────────────────────────────
+    log_info "Installing Certbot..."
+    pkg_install certbot python3-certbot-nginx
+    log_success "Certbot OK"
+
+    # ── Optional: PHP versions ────────────────────────────────────────────────
+    echo -e "\n${BOLD}─── Additional PHP versions ───${NC}"
+    echo -e "${DIM}PHP 8.2 is already installed. Select extra versions.${NC}"
+    echo -e "${DIM}Enter numbers separated by spaces, or press Enter to skip.${NC}"
+    echo -e "${DIM}Tip: you can also install more PHP versions later via: liuer → PHP Manager${NC}\n"
+
+    local -a _all_php_vers=("5.6" "7.4" "8.0" "8.2" "8.3")
+    local -a _avail_vers=()
+    local _idx=1
+    for _v in "${_all_php_vers[@]}"; do
+        if [[ "$_v" == "8.2" ]]; then
+            echo -e "      PHP 8.2  ${DIM}(already installed)${NC}"
+        else
+            if [[ "$_v" == "5.6" ]]; then
+                printf "  %d) PHP %s  %s\n" "$_idx" "$_v" "${RED}(EOL — legacy use only)${NC}"
+            else
+                printf "  %d) PHP %s\n" "$_idx" "$_v"
+            fi
+            _avail_vers+=("$_v")
+            ((_idx++)) || true
+        fi
+    done
+    echo ""
+    echo -e "${YELLOW}Select [1-$((${#_avail_vers[@]})), space-separated]:${NC} \c"
+    read -r _php_input
+
+    for _opt in $_php_input; do
+        if [[ "$_opt" =~ ^[0-9]+$ ]] && [[ "$_opt" -ge 1 ]] && [[ "$_opt" -le ${#_avail_vers[@]} ]]; then
+            local _pver="${_avail_vers[$((_opt-1))]}"
+            [[ "$_pver" == "5.6" ]] && log_warn "PHP 5.6 is EOL since 2018. Installing anyway..."
+            log_info "Installing PHP ${_pver}..."
+            local ep; ep=$(get_php_packages "$_pver")
+            # shellcheck disable=SC2086
+            pkg_install $ep 2>/dev/null || log_warn "PHP $_pver install error — may not be available on this OS version."
+            local esvc; esvc=$(get_php_service "$_pver")
+            systemctl enable "$esvc" && systemctl start "$esvc" || true
+            _fix_fpm_socket_perms "$_pver"
+            log_success "PHP $_pver OK"
+        else
+            log_warn "Invalid PHP option: $_opt, skipping."
+        fi
+    done
+
+    # ── Optional: Database ────────────────────────────────────────────────────
+    echo -e "\n${BOLD}─── Additional Database ───${NC}"
+    echo -e "${DIM}MariaDB is already installed. Select one additional database or skip.${NC}\n"
+    echo "  1) PostgreSQL"
+    echo "  2) Skip"
+    echo ""
+    echo -e "${YELLOW}Select [1-2]:${NC} \c"
+    read -r _db_input
+
+    case "$_db_input" in
+        1)
+            log_info "Installing PostgreSQL..."
+            case "$OS_FAMILY" in
+                rhel)
+                    pkg_install postgresql-server postgresql-contrib
+                    postgresql-setup --initdb 2>/dev/null || true ;;
+                debian)
+                    pkg_install postgresql postgresql-contrib ;;
+            esac
+            systemctl enable postgresql && systemctl start postgresql
+            log_success "PostgreSQL OK"
+            ;;
+        *)
+            log_info "Skipping additional database."
+            ;;
+    esac
+
+    # ── Optional: Cache ───────────────────────────────────────────────────────
+    echo -e "\n${BOLD}─── Cache ───${NC}"
+    echo -e "${DIM}Redis and Memcached serve a similar purpose. Select one or skip.${NC}\n"
+    echo "  1) Redis      (recommended — widely used, supports persistence)"
+    echo "  2) Memcached  (lightweight, pure in-memory)"
+    echo "  3) Skip"
+    echo ""
+    echo -e "${YELLOW}Select [1-3]:${NC} \c"
+    read -r _cache_input
+
+    case "$_cache_input" in
+        1)
+            log_info "Installing Redis..."
+            case "$OS_FAMILY" in
+                rhel)   pkg_install redis ;;
+                debian) pkg_install redis-server ;;
+            esac
+            local rsvc="redis"; [[ "$OS_FAMILY" == "debian" ]] && rsvc="redis-server"
+            systemctl enable "$rsvc" && systemctl start "$rsvc"
+            log_success "Redis OK"
+            ;;
+        2)
+            log_info "Installing Memcached..."
+            pkg_install memcached libmemcached-tools
+            case "$OS_FAMILY" in
+                rhel)   pkg_install php-pecl-memcached 2>/dev/null || true ;;
+                debian) pkg_install php-memcached 2>/dev/null || true ;;
+            esac
+            systemctl enable memcached && systemctl start memcached
+            log_success "Memcached OK"
+            ;;
+        *)
+            log_info "Skipping cache."
+            ;;
+    esac
+
+    # ── Optional: Fail2ban ────────────────────────────────────────────────────
+    echo -e "\n${BOLD}─── Fail2ban ───${NC}"
+    echo -e "${DIM}Protects against brute-force attacks (SSH, Nginx, etc.)${NC}\n"
+    confirm_action "Install Fail2ban?" && {
+        log_info "Installing Fail2ban..."
+        pkg_install fail2ban
+        systemctl enable fail2ban && systemctl start fail2ban
+        log_success "Fail2ban OK"
+    } || log_info "Skipping Fail2ban."
+
+    # ── Optional: phpMyAdmin ──────────────────────────────────────────────────
+    echo -e "\n${BOLD}─── phpMyAdmin ───${NC}"
+    local _pma_path=""
+    [[ -f "${CONFIG_DIR}/pma_path" ]] && _pma_path=$(cat "${CONFIG_DIR}/pma_path")
+    if [[ -n "$_pma_path" ]]; then
+        local _pma_ip; _pma_ip=$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null || echo "SERVER_IP")
+        echo -e "${DIM}phpMyAdmin: http://${_pma_ip}/${_pma_path}/${NC}\n"
+    else
+        echo -e "${DIM}Web-based MySQL/MariaDB management${NC}\n"
+    fi
+    confirm_action "Install phpMyAdmin?" && install_phpmyadmin || log_info "Skipping phpMyAdmin."
+
+    # ── Directory structure ───────────────────────────────────────────────────
+    log_info "Creating directory structure..."
+    mkdir -p "$CONFIG_DIR" "$SITES_META_DIR" "$INSTALL_DIR" /home/web /home/backup /var/www
+    chmod 700 "$CONFIG_DIR"
+    touch "$DB_LIST_FILE" && chmod 600 "$DB_LIST_FILE"
+    ensure_secret_key
+
+    # ── Copy script ───────────────────────────────────────────────────────────
+    local me; me=$(readlink -f "$0")
+    if [[ "$me" != "${INSTALL_DIR}/${SCRIPT_NAME}" ]]; then
+        cp "$me" "${INSTALL_DIR}/${SCRIPT_NAME}"
+    fi
+    chmod +x "${INSTALL_DIR}/${SCRIPT_NAME}"
+    ln -sf "${INSTALL_DIR}/${SCRIPT_NAME}" "$BIN_LINK"
+    log_success "Symlink: $BIN_LINK → ${INSTALL_DIR}/${SCRIPT_NAME}"
+
+    # ── Log file ──────────────────────────────────────────────────────────────
+    touch "$LOG_FILE" && chmod 640 "$LOG_FILE"
+
+    # ── Disable default PHP-FPM www.conf pools ───────────────────────────────
+    _disable_default_fpm_pools
+
+    # ── SSH motd ──────────────────────────────────────────────────────────────
+    setup_motd
+
+    echo ""
+    separator
+    log_success "=== INSTALLATION COMPLETE ==="
+    echo ""
+    echo -e "  ${BOLD}Command      :${NC} liuer"
+    echo -e "  ${BOLD}Install dir  :${NC} ${INSTALL_DIR}"
+    echo -e "  ${BOLD}Config dir   :${NC} ${CONFIG_DIR}"
+    echo -e "  ${BOLD}Web root     :${NC} /home/web/<user>/<domain>/"
+    echo -e "  ${BOLD}Backups      :${NC} /home/backup/<user>/<domain>/"
+    echo -e "  ${BOLD}Log file     :${NC} ${LOG_FILE}"
+    echo ""
+
+    # MariaDB root password (if set during install)
+    if [[ -f /root/.my.cnf ]]; then
+        local _db_pass; _db_pass=$(grep "^password" /root/.my.cnf 2>/dev/null | cut -d= -f2 | xargs)
+        [[ -n "$_db_pass" ]] && echo -e "  ${BOLD}MariaDB root :${NC} ${_db_pass}"
+    fi
+
+    # phpMyAdmin secret path
+    if [[ -f "${CONFIG_DIR}/pma_path" ]]; then
+        local _pma; _pma=$(cat "${CONFIG_DIR}/pma_path")
+        local _ip; _ip=$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null \
+                         || curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
+                         || echo "SERVER_IP")
+        echo -e "  ${BOLD}phpMyAdmin   :${NC} http://${_ip}/${_pma}/"
+    fi
+
+    echo ""
+    separator
+    echo ""
+}
+
+# =============================================================================
+# LOG VIEWER
+# =============================================================================
+view_site_logs() {
+    print_section "LOG VIEWER"
+    _select_domain "Select site" || { press_enter; return; }
+    local _ldom="$SELECTED_DOMAIN"
+
+    echo -e "\n  Log type:"
+    echo "   1  Nginx access log"
+    echo "   2  Nginx error log"
+    echo "   3  PHP-FPM error log"
+    echo -ne "  Select [1-3]: "; read -r _ltype
+
+    local _lfile=""
+    case "$_ltype" in
+        1) _lfile="/var/log/nginx/${_ldom}-access.log" ;;
+        2) _lfile="/var/log/nginx/${_ldom}-error.log" ;;
+        3) local _meta="${SITES_META_DIR}/${_ldom}.conf"
+           local _pver; _pver=$(grep 'PHP_VERSION=' "$_meta" 2>/dev/null | cut -d= -f2 || echo "")
+           case "$OS_FAMILY" in
+               rhel)   _lfile="/var/opt/remi/php${_pver//./}/log/php-fpm/error.log" ;;
+               debian) _lfile="/var/log/php${_pver}-fpm.log" ;;
+           esac ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    if [[ ! -f "$_lfile" ]]; then
+        log_error "Log file not found: $_lfile"
+        press_enter; return
+    fi
+
+    echo -e "\n  View mode:"
+    echo "   1  Last 50 lines"
+    echo "   2  Last 100 lines"
+    echo "   3  Follow live (Ctrl+C to stop)"
+    echo -ne "  Select [1-3]: "; read -r _lmode
+
+    case "$_lmode" in
+        1) tail -n 50  "$_lfile" | less -R ;;
+        2) tail -n 100 "$_lfile" | less -R ;;
+        3) tail -f "$_lfile" ;;
+        *) log_warn "Invalid selection." ;;
+    esac
+    press_enter
+}
+
+# =============================================================================
+# RESOURCE MONITOR
+# =============================================================================
+show_resources() {
+    print_section "RESOURCE MONITOR"
+
+    echo -e "\n  ${BOLD}── Load & Uptime ───────────────────────────────────${NC}"
+    uptime
+    echo ""
+
+    echo -e "  ${BOLD}── Memory ──────────────────────────────────────────${NC}"
+    free -h
+    echo ""
+
+    echo -e "  ${BOLD}── Disk ────────────────────────────────────────────${NC}"
+    df -h 2>/dev/null | grep -v tmpfs | grep -v devtmpfs | grep -v udev
+    echo ""
+
+    echo -e "  ${BOLD}── Top 5 Processes (CPU) ───────────────────────────${NC}"
+    ps aux --sort=-%cpu 2>/dev/null | awk 'NR==1{printf "  %-12s %5s %5s %s\n","USER","%CPU","%MEM","COMMAND"} NR>1 && NR<=7{printf "  %-12s %5s %5s %s\n",$1,$3,$4,$11}'
+    echo ""
+
+    press_enter
+}
+
+show_hardware_info() {
+    print_section "HARDWARE & SYSTEM INFO"
+    echo ""
+
+    echo -e "  ${BOLD}── Operating System ────────────────────────────────${NC}"
+    printf "  %-18s %s\n" "OS:" "$(grep -oP '(?<=PRETTY_NAME=")[^"]+' /etc/os-release 2>/dev/null || uname -s)"
+    printf "  %-18s %s\n" "Kernel:" "$(uname -r)"
+    printf "  %-18s %s\n" "Architecture:" "$(uname -m)"
+    printf "  %-18s %s\n" "Hostname:" "$(hostname)"
+    printf "  %-18s %s\n" "Uptime:" "$(uptime -p 2>/dev/null || uptime)"
+    echo ""
+
+    echo -e "  ${BOLD}── CPU ─────────────────────────────────────────────${NC}"
+    local cpu_model; cpu_model=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs)
+    local cpu_cores; cpu_cores=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null)
+    local cpu_mhz;   cpu_mhz=$(grep -m1 "cpu MHz" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs | cut -d. -f1)
+    local cpu_load;  cpu_load=$(cat /proc/loadavg 2>/dev/null | awk '{print $1" "$2" "$3}')
+    printf "  %-18s %s\n" "Model:" "${cpu_model:-N/A}"
+    printf "  %-18s %s\n" "Cores/Threads:" "${cpu_cores:-N/A}"
+    [[ -n "$cpu_mhz" ]] && printf "  %-18s %s MHz\n" "Speed:" "$cpu_mhz"
+    printf "  %-18s %s\n" "Load avg (1/5/15m):" "$cpu_load"
+    echo ""
+
+    echo -e "  ${BOLD}── Memory (RAM) ────────────────────────────────────${NC}"
+    local mem_total mem_used mem_avail
+    mem_total=$(awk '/^MemTotal:/{printf "%.1f GB", $2/1024/1024}' /proc/meminfo 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/{printf "%.1f GB", $2/1024/1024}' /proc/meminfo 2>/dev/null)
+    mem_used=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{printf "%.1f GB", (t-a)/1024/1024}' /proc/meminfo 2>/dev/null)
+    printf "  %-18s %s\n" "Total:" "$mem_total"
+    printf "  %-18s %s\n" "Used:" "$mem_used"
+    printf "  %-18s %s\n" "Available:" "$mem_avail"
+    echo ""
+
+    echo -e "  ${BOLD}── Disk ────────────────────────────────────────────${NC}"
+    df -h 2>/dev/null | grep -v tmpfs | grep -v devtmpfs | grep -v udev | grep -v loop \
+        | awk 'NR==1{printf "  %-25s %6s %6s %6s %5s\n",$1,$2,$3,$4,$5} NR>1{printf "  %-25s %6s %6s %6s %5s\n",$1,$2,$3,$4,$5}'
+    echo ""
+
+    echo -e "  ${BOLD}── Network Interfaces ──────────────────────────────${NC}"
+    if command -v ip &>/dev/null; then
+        ip -br addr 2>/dev/null | awk '{printf "  %-12s %-10s %s\n", $1, $2, $3}' | grep -v "^  lo "
+    else
+        ifconfig 2>/dev/null | grep -E "^[a-z]|inet " | awk '/^[a-z]/{iface=$1} /inet /{print "  "iface"  "$2}'
+    fi
+    echo ""
+
+    press_enter
+}
+
+disk_benchmark() {
+    print_section "DISK BENCHMARK"
+    echo ""
+    echo -e "  ${YELLOW}This test writes a temporary 512 MB file to measure I/O speed.${NC}"
+    echo -e "  ${DIM}File: /tmp/liuer_bench_$$${NC}"
+    echo ""
+    confirm_action "Run disk benchmark?" || { press_enter; return; }
+
+    local bench_file="/tmp/liuer_bench_$$"
+
+    echo ""
+    echo -e "  ${BOLD}── Sequential Write ────────────────────────────────${NC}"
+    local write_result
+    write_result=$(dd if=/dev/zero of="$bench_file" bs=1M count=512 oflag=direct 2>&1 | tail -1)
+    echo "  $write_result"
+
+    echo ""
+    echo -e "  ${BOLD}── Sequential Read ─────────────────────────────────${NC}"
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    local read_result
+    read_result=$(dd if="$bench_file" of=/dev/null bs=1M iflag=direct 2>&1 | tail -1)
+    echo "  $read_result"
+
+    rm -f "$bench_file"
+    echo ""
+    echo -e "  ${DIM}Temp file removed. Results are single-thread sequential I/O.${NC}"
+    press_enter
+}
+
+# =============================================================================
+# SCHEDULED BACKUP
+# =============================================================================
+_run_scheduled_backup() {
+    # Called by cron: _run_scheduled_backup <domain|--all> <keep> <type:1|2|3>
+    local _target="${1:---all}" _keep="${2:-7}" _btype="${3:-1}"
+
+    _do_one_backup() {
+        local _dom="$1"
+        local _bdir; _bdir="$(get_backup_dir "$_dom")"
+        local _sdir; _sdir="$(get_site_dir "$_dom")"
+        local _ts; _ts=$(date +%Y%m%d_%H%M%S)
+        mkdir -p "$_bdir"
+
+        # Files backup
+        if [[ "$_btype" == "1" || "$_btype" == "2" ]]; then
+            tar -czf "${_bdir}/code_${_ts}.tar.gz" -C "$(dirname "$_sdir")" "$(basename "$_sdir")" 2>/dev/null || true
+        fi
+
+        # Database backup
+        if [[ "$_btype" == "1" || "$_btype" == "3" ]]; then
+            local _dbline; _dbline=$(grep "^${_dom}|" "$DB_LIST_FILE" 2>/dev/null || true)
+            if [[ -n "$_dbline" ]]; then
+                local _dbn _enc _dbt _dpass
+                IFS='|' read -r _ _dbn _ _enc _dbt <<< "$_dbline"
+                _dpass=$(decrypt_pass "$_enc" 2>/dev/null || echo "")
+                case "$_dbt" in
+                    mysql|mariadb)
+                        mysqldump -u root "$_dbn" 2>/dev/null | gzip > "${_bdir}/db_${_ts}.sql.gz" ;;
+                    postgresql)
+                        sudo -u postgres pg_dump "$_dbn" 2>/dev/null | gzip > "${_bdir}/db_${_ts}.sql.gz" ;;
+                esac
+            fi
+        fi
+
+        # Retention policy
+        ls -t "${_bdir}"/code_*.tar.gz 2>/dev/null | tail -n +"$((_keep+1))" | xargs rm -f 2>/dev/null || true
+        ls -t "${_bdir}"/db_*.sql.gz   2>/dev/null | tail -n +"$((_keep+1))" | xargs rm -f 2>/dev/null || true
+        log_info "Auto-backup done: ${_dom}"
+    }
+
+    if [[ "$_target" == "--all" ]]; then
+        for _c in "${NGINX_CONF_DIR}"/*.conf; do
+            [[ -f "$_c" ]] || continue
+            local _d; _d=$(basename "$_c" .conf)
+            [[ "$_d" == "default" || "$_d" == "phpmyadmin" ]] && continue
+            _do_one_backup "$_d"
+        done
+    else
+        _do_one_backup "$_target"
+    fi
+}
+
+schedule_backup() {
+    print_section "SCHEDULE AUTO BACKUP"
+    echo -e "\n  0) All sites"
+    _select_domain "Select site (or 0 for all)" || true
+    local _sdom="${SELECTED_DOMAIN:-all}"
+
+    echo -e "\n${BOLD}Backup type:${NC}"
+    echo "  1) Files + Database"
+    echo "  2) Files only"
+    echo "  3) Database only"
+    local _sbtype
+    echo -e "${YELLOW}Select [1-3]:${NC} \c"; read -r _sbtype
+    [[ "$_sbtype" =~ ^[1-3]$ ]] || _sbtype=1
+
+    echo -e "\n${BOLD}Frequency:${NC}"
+    echo "  1) Daily"
+    echo "  2) Weekly (every Sunday)"
+    echo -ne "${YELLOW}Select [1-2]:${NC} "; read -r _sfreq
+
+    echo -ne "\n  Time (HH:MM, e.g. 02:30): "; read -r _stime
+    local _sh="${_stime%%:*}" _sm="${_stime##*:}"
+    [[ "$_sh" =~ ^[0-9]{1,2}$ && "$_sm" =~ ^[0-9]{2}$ ]] \
+        || { log_error "Invalid time format."; press_enter; return 1; }
+
+    echo -ne "  Keep last N backups [7]: "; read -r _skeep
+    [[ -z "$_skeep" ]] && _skeep=7
+
+    local _scron_time
+    case "$_sfreq" in
+        1) _scron_time="${_sm} ${_sh} * * *" ;;
+        2) _scron_time="${_sm} ${_sh} * * 0" ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    local _cron_arg; [[ "$_sdom" == "all" ]] && _cron_arg="--all" || _cron_arg="$_sdom"
+
+    # Remove old entry for same domain
+    (crontab -l 2>/dev/null | grep -v "_cron_backup.*${_cron_arg}") | crontab - 2>/dev/null || true
+
+    # Add new cron entry (pass backup type as 4th arg)
+    (crontab -l 2>/dev/null
+     echo "${_scron_time} /usr/local/bin/liuer _cron_backup ${_cron_arg} ${_skeep} ${_sbtype} >> /var/log/liuer-panel.log 2>&1"
+    ) | crontab -
+
+    local _type_label; case "$_sbtype" in
+        1) _type_label="Files + Database" ;;
+        2) _type_label="Files only" ;;
+        3) _type_label="Database only" ;;
+    esac
+
+    log_success "Scheduled backup set!"
+    printf "  %-12s: %s\n" "Domain"    "$_sdom"
+    printf "  %-12s: %s\n" "Type"      "$_type_label"
+    printf "  %-12s: %s\n" "Schedule"  "$_scron_time"
+    printf "  %-12s: %s\n" "Retention" "last $_skeep backups"
+    press_enter
+}
+
+# =============================================================================
+# SFTP USER
+# =============================================================================
+create_sftp_user() {
+    print_section "CREATE SFTP USER"
+    local _sfdom="${1:-}"
+    if [[ -z "$_sfdom" ]]; then
+        _select_domain "Select site" || { press_enter; return; }
+        _sfdom="$SELECTED_DOMAIN"
+    fi
+    local _sfsite; _sfsite="$(get_site_dir "$_sfdom")"
+    [[ ! -d "$_sfsite" ]] && { log_error "Site not found: $_sfdom"; press_enter; return 1; }
+
+    echo -ne "  SFTP username: "; read -r _sfuser
+    [[ ! "$_sfuser" =~ ^[a-z][a-z0-9_-]{2,31}$ ]] && {
+        log_error "Invalid username. Use: lowercase letters, numbers, - or _ (min 3 chars)"
+        press_enter; return 1
+    }
+    id "$_sfuser" &>/dev/null && { log_error "User '$_sfuser' already exists."; press_enter; return 1; }
+
+    useradd -M -d "$_sfsite" -s /sbin/nologin "$_sfuser" 2>/dev/null \
+        || { log_error "Failed to create system user."; press_enter; return 1; }
+
+    local _sfpass; _sfpass=$(rand_str 16)
+    echo "${_sfuser}:${_sfpass}" | chpasswd
+
+    # chroot requires root:root ownership on the jail dir
+    chown root:root "$_sfsite"
+    local _web_root; _web_root=$(grep 'WEB_ROOT=' "${SITES_META_DIR}/${_sfdom}.conf" 2>/dev/null \
+                                  | cut -d= -f2 || echo "${_sfsite}/public_html")
+    chown -R "${_sfuser}:${_sfuser}" "$_web_root" 2>/dev/null || true
+
+    # Add SFTP block to sshd_config if not already there
+    local _sshd="/etc/ssh/sshd_config"
+    if ! grep -q "Match User ${_sfuser}" "$_sshd"; then
+        cat >> "$_sshd" <<EOF
+
+Match User ${_sfuser}
+    ForceCommand internal-sftp
+    ChrootDirectory ${_sfsite}
+    PermitTunnel no
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    X11Forwarding no
+EOF
+    fi
+    systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+
+    log_success "SFTP user created!"
+    printf "  %-10s: %s\n" "User"     "$_sfuser"
+    printf "  %-10s: %s\n" "Password" "$_sfpass"
+    printf "  %-10s: %s\n" "Root"     "$_sfsite"
+    echo ""
+    echo "  Connect: sftp ${_sfuser}@<server-ip>"
+    press_enter
+}
+
+list_sftp_users() {
+    print_section "SFTP USERS"
+    echo ""
+    local _found=0
+    while IFS= read -r line; do
+        local _u _d
+        _u=$(echo "$line" | grep -oP '(?<=Match User )\S+')
+        [[ -z "$_u" ]] && continue
+        _d=$(grep -A1 "Match User ${_u}" /etc/ssh/sshd_config 2>/dev/null | grep ChrootDirectory | awk '{print $2}')
+        # Only show panel-managed SFTP users (chroot under /home/web/ or legacy /var/www/)
+        [[ "$_d" == "/home/web/"* || "$_d" == "/var/www/"* ]] || continue
+        printf "  %-20s → %s\n" "$_u" "${_d:-unknown}"
+        _found=$((_found+1))
+    done < /etc/ssh/sshd_config
+    [[ $_found -eq 0 ]] && echo "  No SFTP users configured."
+    echo ""
+    press_enter
+}
+
+delete_sftp_user() {
+    print_section "DELETE SFTP USER"
+    local _filter_domain="${1:-}"
+
+    # List SFTP users (filtered by domain if provided)
+    echo ""
+    local -a _sftp_users=()
+    while IFS= read -r _line; do
+        local _su; _su=$(echo "$_line" | grep -oP '(?<=Match User )\S+')
+        [[ -z "$_su" ]] && continue
+        local _sd; _sd=$(grep -A1 "Match User ${_su}" /etc/ssh/sshd_config 2>/dev/null \
+                         | grep ChrootDirectory | awk '{print $2}')
+        [[ "$_sd" == "/home/web/"* || "$_sd" == "/var/www/"* ]] || continue
+        if [[ -n "$_filter_domain" ]]; then
+            [[ "$_sd" == "$(get_site_dir "$_filter_domain")" || "$_sd" == "/var/www/${_filter_domain}" ]] || continue
+        fi
+        _sftp_users+=("$_su")
+        printf "  %2d) %s\n" "${#_sftp_users[@]}" "$_su"
+    done < /etc/ssh/sshd_config
+    [[ ${#_sftp_users[@]} -eq 0 ]] && { log_warn "No SFTP users found."; press_enter; return; }
+    echo "   0) Cancel"
+    echo -ne "\n  Select [1-${#_sftp_users[@]}]: "; read -r _sel
+    [[ "$_sel" == "0" || -z "$_sel" ]] && return
+    [[ ! "$_sel" =~ ^[0-9]+$ ]] || [[ "$_sel" -lt 1 ]] || [[ "$_sel" -gt ${#_sftp_users[@]} ]] && {
+        log_warn "Invalid selection."; press_enter; return; }
+    local _delu="${_sftp_users[$((${_sel}-1))]}"
+
+    confirm_danger "Remove SFTP user: ${_delu}" || { log_info "Cancelled."; return; }
+
+    confirm_danger "Remove SFTP user: ${_delu}" || { log_info "Cancelled."; return; }
+
+    userdel "$_delu" 2>/dev/null || log_warn "Could not remove system user."
+
+    # Remove Match block from sshd_config
+    local _tmp; _tmp=$(mktemp)
+    awk "/Match User ${_delu}/{skip=1} skip && /^$/{skip=0; next} !skip" \
+        /etc/ssh/sshd_config > "$_tmp" && mv "$_tmp" /etc/ssh/sshd_config
+    systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+
+    log_success "SFTP user '${_delu}' removed."
+    press_enter
+}
+
+toggle_site_lock() {
+    print_section "LOCK / UNLOCK SITE"
+
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+
+    local _php_ver="" _site_user=""
+    [[ -f "$_meta" ]] && {
+        _php_ver=$(grep "^PHP_VERSION=" "$_meta" | cut -d= -f2)
+        _site_user=$(grep "^WEB_USER=" "$_meta" | cut -d= -f2)
+    }
+    local _cur_status; _cur_status=$(grep "^STATUS=" "$_meta" 2>/dev/null | cut -d= -f2)
+    _cur_status="${_cur_status:-active}"
+
+    local _nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local _nginx_dis="${NGINX_CONF_DIR}/${domain}.conf.disabled"
+    local _pool_conf="" _pool_dis=""
+    if [[ -n "$_php_ver" ]]; then
+        _pool_conf=$(get_php_pool_conf "$_php_ver" "$domain")
+        _pool_dis="${_pool_conf}.disabled"
+    fi
+
+    echo -e "\n  Site   : ${BOLD}${domain}${NC}"
+    if [[ "$_cur_status" == "locked" ]]; then
+        echo -e "  Status : ${RED}LOCKED${NC}"
+        echo ""
+        echo "  1) Unlock site"
+        echo "  0) Cancel"
+        echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+        [[ "$_ch" != "1" ]] && return 0
+
+        # Unlock nginx
+        [[ -f "$_nginx_dis" ]] && mv "$_nginx_dis" "$_nginx_conf"
+        # Unlock PHP-FPM pool
+        [[ -n "$_pool_dis" && -f "$_pool_dis" ]] && mv "$_pool_dis" "$_pool_conf"
+
+        sed -i "s/^STATUS=.*/STATUS=active/" "$_meta"
+        grep -q "^STATUS=" "$_meta" || echo "STATUS=active" >> "$_meta"
+
+        [[ -n "$_php_ver" ]] && {
+            local svc; svc=$(get_php_service "$_php_ver")
+            systemctl reload "$svc" 2>/dev/null || true
+        }
+        nginx -t &>/dev/null && nginx -s reload
+        log_success "Site ${domain} unlocked."
+    else
+        echo -e "  Status : ${GREEN}ACTIVE${NC}"
+        echo ""
+        echo "  1) Lock site (disable PHP + nginx)"
+        echo "  0) Cancel"
+        echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+        [[ "$_ch" != "1" ]] && return 0
+
+        # Lock PHP-FPM pool
+        [[ -n "$_pool_conf" && -f "$_pool_conf" ]] && mv "$_pool_conf" "$_pool_dis"
+        # Lock nginx
+        [[ -f "$_nginx_conf" ]] && mv "$_nginx_conf" "$_nginx_dis"
+
+        sed -i "s/^STATUS=.*/STATUS=locked/" "$_meta"
+        grep -q "^STATUS=" "$_meta" || echo "STATUS=locked" >> "$_meta"
+
+        [[ -n "$_php_ver" ]] && {
+            local svc; svc=$(get_php_service "$_php_ver")
+            systemctl reload "$svc" 2>/dev/null || true
+        }
+        nginx -t &>/dev/null && nginx -s reload
+        log_warn "Site ${domain} locked — PHP and nginx disabled."
+    fi
+    press_enter
+}
+
+# =============================================================================
+# SUB-MENUS
+# =============================================================================
+_sub_header() {
+    print_header
+    echo -e "  ${BOLD}$1${NC}"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────${NC}"
+}
+
+_sub_footer() {
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────${NC}"
+    echo -e "${DIM}   0  Back${NC}"
+    echo -ne "${YELLOW}  Select: ${NC}"
+}
+
+menu_website() {
+    while true; do
+        _sub_header "WEBSITE"
+        echo "   1  Create site"
+        echo "   2  Delete site"
+        echo "   3  List sites"
+        echo "   4  Site details"
+        echo "   5  Change PHP version"
+        echo "   6  HTTP/2 & HTTP/3"
+        echo "   7  PHP hardening (on/off)"
+        echo "   8  Lock / Unlock site"
+        echo "   9  Manage users"
+        echo "  10  View logs"
+        echo "  11  Upload & timeout settings"
+        echo "  12  SSL management"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1)  create_website ;;
+            2)  delete_website ;;
+            3)  list_websites ;;
+            4)  show_website_detail ;;
+            5)  change_php_version ;;
+            6)  toggle_http_protocol ;;
+            7)  toggle_php_hardening ;;
+            8)  toggle_site_lock ;;
+            9)  manage_site_users ;;
+            10) view_site_logs ;;
+            11) manage_upload_settings ;;
+            12) manage_site_ssl ;;
+            0)  return ;;
+            *)  log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+manage_site_users() {
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+
+    while true; do
+        print_section "USERS — ${domain}"
+
+        # Web user info
+        local _wu="" _wu_pass="" _wu_login=""
+        _wu=$(grep "^WEB_USER=" "$_meta" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$_wu" ]] && [[ -f "$WEB_USERS_FILE" ]]; then
+            local _wu_enc; _wu_enc=$(grep "^${_wu}|" "$WEB_USERS_FILE" | cut -d'|' -f2)
+            local _wu_lf;  _wu_lf=$(grep "^${_wu}|"  "$WEB_USERS_FILE" | cut -d'|' -f3)
+            _wu_pass=$(decrypt_pass "$_wu_enc" 2>/dev/null || echo "[error]")
+            _wu_login="${_wu_lf:-0}"
+        fi
+
+        echo -e "\n  ${BOLD}── Web User ──────────────────────────────${NC}"
+        if [[ -n "$_wu" ]]; then
+            printf "  %-10s: %s\n" "Username" "$_wu"
+            printf "  %-10s: %s\n" "Password" "$_wu_pass"
+            printf "  %-10s: %s\n" "Login"    "$([[ "$_wu_login" == "1" ]] && echo "Allowed" || echo "Disabled")"
+        else
+            echo "  No web user assigned."
+        fi
+
+        # SFTP users for this site
+        echo -e "\n  ${BOLD}── SFTP Users ────────────────────────────${NC}"
+        local _sftp_found=0
+        while IFS= read -r _line; do
+            local _su; _su=$(echo "$_line" | grep -oP '(?<=Match User )\S+')
+            [[ -z "$_su" ]] && continue
+            local _sd; _sd=$(grep -A1 "Match User ${_su}" /etc/ssh/sshd_config 2>/dev/null \
+                             | grep ChrootDirectory | awk '{print $2}')
+            [[ "$_sd" == "$(get_site_dir "$domain")" || "$_sd" == "/var/www/${domain}" ]] || continue
+            printf "  %-20s → %s\n" "$_su" "$_sd"
+            _sftp_found=$((_sftp_found+1))
+        done < /etc/ssh/sshd_config
+        [[ $_sftp_found -eq 0 ]] && echo "  No SFTP users."
+
+        echo ""
+        separator
+        echo "   1  Change web user"
+        echo "   2  Toggle web user login"
+        echo "   3  Add SFTP user"
+        echo "   4  Delete SFTP user"
+        echo "   0  Back"
+        echo -ne "${YELLOW}  Select: ${NC}"; read -r _ch
+        case "$_ch" in
+            1) SELECTED_DOMAIN="$domain"; change_web_user ;;
+            2)
+                if [[ -n "$_wu" ]]; then
+                    SELECTED_WEB_USER="$_wu"; toggle_web_user_login
+                else
+                    log_warn "No web user assigned to this site."
+                    press_enter
+                fi
+                ;;
+            3) create_sftp_user "$domain" ;;
+            4) delete_sftp_user "$domain" ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_sftp() {
+    while true; do
+        _sub_header "SFTP USERS"
+        echo "   1  Create SFTP user"
+        echo "   2  List SFTP users"
+        echo "   3  Delete SFTP user"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) create_sftp_user ;;
+            2) list_sftp_users ;;
+            3) delete_sftp_user ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_database() {
+    while true; do
+        _sub_header "DATABASE"
+        echo "   1  Create database"
+        echo "   2  List databases"
+        echo "   3  Delete database"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) create_database ;;
+            2) list_databases ;;
+            3) delete_database ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_backup() {
+    while true; do
+        _sub_header "BACKUP"
+        echo "   1  Backup site now"
+        echo "   2  Restore backup"
+        echo "   3  Schedule auto backup"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) backup_website ;;
+            2) restore_backup ;;
+            3) schedule_backup ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_system() {
+    while true; do
+        _sub_header "SYSTEM"
+        echo "   1  Start service"
+        echo "   2  Stop service"
+        echo "   3  Restart service"
+        echo "   4  Enable service"
+        echo "   5  Disable service"
+        echo "   6  Reload Nginx"
+        echo "   7  Service status"
+        echo "   8  Install extra service"
+        echo "   9  Resource monitor"
+        echo "  10  Hardware & system info"
+        echo "  11  Disk benchmark"
+        if [[ -f "${CONFIG_DIR}/pma_path" ]]; then
+        echo "  12  Show phpMyAdmin URL"
+        fi
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) service_control "start" ;;
+            2) service_control "stop" ;;
+            3) service_control "restart" ;;
+            4) service_control "enable" ;;
+            5) service_control "disable" ;;
+            6) nginx -t &>/dev/null && nginx -s reload \
+                    && log_success "Nginx reloaded." \
+                    || log_error "Nginx config test failed!"
+               press_enter ;;
+            7) show_status ;;
+            8) install_extra_service ;;
+            9) show_resources ;;
+           10) show_hardware_info ;;
+           11) disk_benchmark ;;
+           12) if [[ -f "${CONFIG_DIR}/pma_path" ]]; then
+                   local _pma; _pma=$(cat "${CONFIG_DIR}/pma_path")
+                   local _ip; _ip=$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null \
+                                || curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
+                                || echo "SERVER_IP")
+                   echo ""
+                   echo -e "  ${BOLD}phpMyAdmin URL:${NC} http://${_ip}/${_pma}/"
+                   echo ""
+               fi
+               press_enter ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+# =============================================================================
+# MAIN MENU
+# =============================================================================
+main_menu() {
+    while true; do
+        print_header
+        echo -e "  ${DIM}──────────────────────────────────────────────────────────${NC}"
+        printf "  %-28s%s\n"  " 1  Website"      " 6  Backup"
+        printf "  %-28s%s\n"  " 2  Database"     " 7  PHP Manager"
+        printf "  %-28s%s\n"  " 3  Cache"        " 8  Update"
+        printf "  %-28s%s\n"  " 4  System"       " 9  Web Users"
+        printf "  %-28s%s\n"  " 5  Security"     ""
+        echo -e "  ${DIM}──────────────────────────────────────────────────────────${NC}"
+        echo -e "${DIM}   0  Exit${NC}"
+        echo -ne "${YELLOW}  Select: ${NC}"
+        read -r _choice
+
+        case "$_choice" in
+            1) menu_website ;;
+            2) menu_database ;;
+            3) manage_cache ;;
+            4) menu_system ;;
+            5) manage_security ;;
+            6) menu_backup ;;
+            7) manage_php ;;
+            8) manage_updates ;;
+            9) manage_web_users ;;
+            0) echo -e "\n${BOLD}Goodbye!${NC}\n"; exit 0 ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+main() {
+    # Init log file
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
+
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        # ── First-time install ────────────────────────────────────────────────
+        --install|install)
+            check_root
+            detect_os
+            do_install
+            ;;
+
+        # ── Update tool ───────────────────────────────────────────────────────
+        update)
+            check_root
+            detect_os
+            update_tool
+            ;;
+
+        # ── Repair system ─────────────────────────────────────────────────────
+        repair)
+            check_root
+            detect_os
+            do_repair
+            press_enter
+            ;;
+
+        # ── Auto repair (called internally after update, no interaction) ──────
+        _repair_auto)
+            check_root
+            detect_os
+            do_repair
+            ;;
+
+        # ── Check for updates ─────────────────────────────────────────────────
+        check-update)
+            detect_os
+            check_update
+            ;;
+
+        # ── Show version ──────────────────────────────────────────────────────
+        version|--version|-v)
+            detect_os
+            show_version
+            ;;
+
+        # ── Help ──────────────────────────────────────────────────────────────
+        help|--help|-h)
+            echo ""
+            echo -e "${BOLD}Liuer Panel v${VERSION}${NC} — CLI web server management"
+            echo ""
+            echo "Usage: liuer [command]"
+            echo ""
+            echo "  (none)         Open management menu"
+            echo "  install        First-time installation"
+            echo "  update         Update tool to latest version"
+            echo "  repair         Re-apply system fixes (SELinux, firewall, nginx)"
+            echo "  check-update   Check if a new version is available"
+            echo "  version        Show current version"
+            echo "  help           Show this help"
+            echo ""
+            ;;
+
+        # ── Main menu ─────────────────────────────────────────────────────────
+        "")
+            check_root
+            detect_os
+            ensure_secret_key
+            main_menu
+            ;;
+
+        _cron_backup)
+            detect_os
+            _run_scheduled_backup "${2:-}" "${3:-7}"
+            ;;
+
+        # ── Unknown command ───────────────────────────────────────────────────
+        *)
+            echo -e "${RED}Unknown command: '${cmd}'${NC}"
+            echo "Run 'liuer help' for available commands."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
