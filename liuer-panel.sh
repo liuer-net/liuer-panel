@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.24"
+readonly VERSION="2.5.25"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -4423,6 +4423,35 @@ menu_backup() {
     done
 }
 
+show_pma_url() {
+    print_section "PHPMYADMIN URL"
+    if [[ ! -f "${CONFIG_DIR}/pma_path" ]]; then
+        log_warn "phpMyAdmin is not installed."
+        press_enter; return
+    fi
+
+    local _pma; _pma=$(cat "${CONFIG_DIR}/pma_path")
+    log_info "Fetching server IP..."
+    local _ip; _ip=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null \
+                  || curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
+                  || hostname -I 2>/dev/null | awk '{print $1}' \
+                  || echo "SERVER_IP")
+    local _url="http://${_ip}/${_pma}/"
+
+    echo ""
+    echo -e "  ${BOLD}phpMyAdmin URL:${NC}"
+    echo ""
+    # Plain line — easy to select & copy
+    echo "  ${_url}"
+    echo ""
+    # Also save to file for easy access
+    echo "$_url" > "${CONFIG_DIR}/pma_url"
+    echo -e "  ${DIM}URL saved to: ${CONFIG_DIR}/pma_url${NC}"
+    echo -e "  ${DIM}Run: cat ${CONFIG_DIR}/pma_url${NC}"
+    echo ""
+    press_enter
+}
+
 menu_system() {
     while true; do
         _sub_header "SYSTEM"
@@ -4456,16 +4485,7 @@ menu_system() {
             9) show_resources ;;
            10) show_hardware_info ;;
            11) disk_benchmark ;;
-           12) if [[ -f "${CONFIG_DIR}/pma_path" ]]; then
-                   local _pma; _pma=$(cat "${CONFIG_DIR}/pma_path")
-                   local _ip; _ip=$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null \
-                                || curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
-                                || echo "SERVER_IP")
-                   echo ""
-                   echo -e "  ${BOLD}phpMyAdmin URL:${NC} http://${_ip}/${_pma}/"
-                   echo ""
-               fi
-               press_enter ;;
+           12) show_pma_url ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
