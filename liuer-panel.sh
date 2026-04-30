@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.21"
+readonly VERSION="2.5.22"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -3076,12 +3076,31 @@ show_version() {
     echo ""
 }
 
+# Get latest commit SHA from GitHub API (short-lived cache ~60s, not file CDN cache)
+_get_github_sha() {
+    curl -fsSL --max-time 10 \
+        "https://api.github.com/repos/liuer-net/liuer-panel/git/ref/heads/main" \
+        2>/dev/null | grep -oP '"sha":\s*"\K[a-f0-9]{40}' | head -1
+}
+
 _fetch_remote_ver() {
-    local ver_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/version.txt?$(date +%s)"
-    local v
-    v=$(curl -fsSL --max-time 10 \
-        -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
-        "$ver_url" 2>/dev/null | tr -d '[:space:]')
+    # Use commit SHA to get version.txt — SHA-based URLs bypass CDN branch cache
+    local sha; sha=$(_get_github_sha)
+    local v=""
+
+    if [[ -n "$sha" ]]; then
+        v=$(curl -fsSL --max-time 10 \
+            "https://raw.githubusercontent.com/liuer-net/liuer-panel/${sha}/version.txt" \
+            2>/dev/null | tr -d '[:space:]')
+    fi
+
+    # Fallback: raw URL with timestamp
+    if [[ -z "$v" || ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        v=$(curl -fsSL --max-time 15 \
+            "https://raw.githubusercontent.com/liuer-net/liuer-panel/main/version.txt?$(date +%s)" \
+            2>/dev/null | tr -d '[:space:]')
+    fi
+
     echo "$v"
 }
 
@@ -3107,11 +3126,11 @@ check_update() {
 
 update_tool() {
     print_section "UPDATE LIUER PANEL"
-
-    local raw_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/${SCRIPT_NAME}?$(date +%s)"
     local target="${INSTALL_DIR}/${SCRIPT_NAME}"
 
     log_info "Fetching remote version..."
+    # Get SHA once — reuse for both version check and download URL
+    local sha; sha=$(_get_github_sha)
     local remote_ver; remote_ver=$(_fetch_remote_ver)
 
     if [[ -z "$remote_ver" ]]; then
@@ -3132,10 +3151,16 @@ update_tool() {
     cp "$target" "$backup_path" \
         || { log_error "Backup failed. Aborting."; return 1; }
 
+    # Use SHA-based URL if available (bypasses CDN cache), else fallback
+    local raw_url
+    if [[ -n "$sha" ]]; then
+        raw_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/${sha}/${SCRIPT_NAME}"
+    else
+        raw_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/${SCRIPT_NAME}?$(date +%s)"
+    fi
+
     log_info "Downloading v${remote_ver}..."
-    curl -fsSL --max-time 120 \
-        -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
-        "$raw_url" -o "${target}.tmp"
+    curl -fsSL --max-time 120 "$raw_url" -o "${target}.tmp"
     local dl_rc=$?
 
     if [[ $dl_rc -eq 0 && -s "${target}.tmp" && \
