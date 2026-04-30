@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.22"
+readonly VERSION="2.5.23"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1539,8 +1539,8 @@ setup_ssl_free() {
         ssl_email=$(cat "$ssl_email_file")
         log_info "Using saved SSL email: ${ssl_email}"
         echo -e "  ${DIM}(Enter new email to change, or press Enter to keep)${NC}"
-        echo -ne "  Email [${ssl_email}]: "; read -r _new_email
-        _new_email=$(echo "$_new_email" | xargs 2>/dev/null || echo "$_new_email")
+        read -r -p "  Email [${ssl_email}] (Enter to keep): " _new_email
+        _new_email="${_new_email// /}"
         if [[ -n "$_new_email" ]]; then
             ssl_email="$_new_email"
             echo "$ssl_email" > "$ssl_email_file"
@@ -1548,13 +1548,11 @@ setup_ssl_free() {
         fi
     else
         while true; do
-            echo -e "${BOLD}Email for Let's Encrypt${NC} ${DIM}(0 to cancel)${NC}: \c"
-            read -r ssl_email
-            # trim whitespace
-            ssl_email=$(echo "$ssl_email" | xargs 2>/dev/null || echo "$ssl_email")
+            read -r -p "  Email for Let's Encrypt (0 to cancel): " ssl_email
+            ssl_email="${ssl_email// /}"
             [[ "$ssl_email" == "0" || "$ssl_email" == "q" ]] && return 1
-            [[ "$ssl_email" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]] && break
-            log_warn "Invalid email format. Example: you@example.com"
+            [[ "$ssl_email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && break
+            log_warn "Invalid email. Example: you@example.com"
         done
         echo "$ssl_email" > "$ssl_email_file"
         chmod 600 "$ssl_email_file"
