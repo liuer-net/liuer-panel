@@ -3992,17 +3992,40 @@ create_sftp_user() {
     local _sfsite; _sfsite="$(get_site_dir "$_sfdom")"
     [[ ! -d "$_sfsite" ]] && { log_error "Site not found: $_sfdom"; press_enter; return 1; }
 
-    echo -ne "  SFTP username: "; read -r _sfuser
-    [[ ! "$_sfuser" =~ ^[a-z][a-z0-9_-]{2,31}$ ]] && {
-        log_error "Invalid username. Use: lowercase letters, numbers, - or _ (min 3 chars)"
-        press_enter; return 1
-    }
-    id "$_sfuser" &>/dev/null && { log_error "User '$_sfuser' already exists."; press_enter; return 1; }
+    echo ""
+    echo "  1) Auto   — generate username & password automatically"
+    echo "  2) Manual — enter username yourself"
+    echo "  0) Cancel"
+    echo -ne "${YELLOW}  Select: ${NC}"; read -r _sfmode
+
+    local _sfuser _sfpass
+    case "$_sfmode" in
+        1)
+            # Auto: derive username from domain (strip www. and TLD, max 16 chars)
+            local _base; _base=$(echo "$_sfdom" | sed 's/^www\.//' | cut -d. -f1 | tr -cd 'a-z0-9' | cut -c1-16)
+            [[ ${#_base} -lt 3 ]] && _base="sftp${_base}"
+            _sfuser="${_base}"
+            # Avoid collision by appending random suffix
+            if id "$_sfuser" &>/dev/null; then
+                _sfuser="${_base}_$(rand_str 4 | tr '[:upper:]' '[:lower:]')"
+            fi
+            _sfpass=$(rand_str 16)
+            ;;
+        2)
+            echo -ne "  SFTP username: "; read -r _sfuser
+            [[ ! "$_sfuser" =~ ^[a-z][a-z0-9_-]{2,31}$ ]] && {
+                log_error "Invalid username. Use: lowercase letters, numbers, - or _ (min 3 chars)"
+                press_enter; return 1
+            }
+            id "$_sfuser" &>/dev/null && { log_error "User '$_sfuser' already exists."; press_enter; return 1; }
+            _sfpass=$(rand_str 16)
+            ;;
+        0|*) return ;;
+    esac
 
     useradd -M -d "$_sfsite" -s /sbin/nologin "$_sfuser" 2>/dev/null \
         || { log_error "Failed to create system user."; press_enter; return 1; }
 
-    local _sfpass; _sfpass=$(rand_str 16)
     echo "${_sfuser}:${_sfpass}" | chpasswd
 
     # chroot requires root:root ownership on the jail dir
