@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.25"
+readonly VERSION="2.5.26"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -4094,8 +4094,15 @@ create_sftp_user() {
         chmod 755 "$_web_root" 2>/dev/null || true
     fi
 
-    # Add SFTP block to sshd_config if not already there
+    # Ensure Subsystem sftp uses internal-sftp (required for ChrootDirectory + ForceCommand)
     local _sshd="/etc/ssh/sshd_config"
+    if grep -qP '^\s*Subsystem\s+sftp\s+(?!internal-sftp)' "$_sshd" 2>/dev/null; then
+        sed -i 's|^\s*Subsystem\s\+sftp\s\+.*|Subsystem sftp internal-sftp|' "$_sshd"
+    elif ! grep -q 'Subsystem sftp' "$_sshd"; then
+        echo "Subsystem sftp internal-sftp" >> "$_sshd"
+    fi
+
+    # Add SFTP Match block if not already there
     if ! grep -q "Match User ${_sfuser}" "$_sshd"; then
         cat >> "$_sshd" <<EOF
 
@@ -4108,7 +4115,9 @@ Match User ${_sfuser}
     X11Forwarding no
 EOF
     fi
-    systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+
+    # Restart sshd (not just reload) to apply Subsystem change
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
     log_success "SFTP user created!"
     printf "  %-10s: %s\n" "User"     "$_sfuser"
