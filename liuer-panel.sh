@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.31"
+readonly VERSION="2.5.32"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -313,6 +313,7 @@ pm.max_children = 5
 pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 3
+umask = 0007
 php_admin_value[error_log] = /var/log/nginx/${domain}_php_error.log
 php_admin_flag[log_errors] = on
 php_admin_value[open_basedir] = ${site_path}:/tmp:/var/tmp
@@ -394,17 +395,29 @@ _repair_sftp_perms() {
             local _croot="${BASH_REMATCH[1]}"
             if [[ -d "$_croot" ]]; then
                 chown root:root "$_croot" && chmod 755 "$_croot"
-                find "$_croot" -mindepth 1 -type d -exec chmod 770 {} \; 2>/dev/null || true
-                find "$_croot" -mindepth 1 -type f -exec chmod 660 {} \; 2>/dev/null || true
-                # Fix group membership: primary group = web group (reliable, always active)
-                local _grp; _grp=$(find "$_croot" -mindepth 1 -maxdepth 1 -type d \
+                # Detect web_user group from site meta (most reliable)
+                local _dom; _dom=$(basename "$_croot")
+                local _grp; _grp=$(grep "^WEB_USER=" "${SITES_META_DIR}/${_dom}.conf" 2>/dev/null \
+                    | cut -d= -f2 || true)
+                # Fallback: detect from subdirs
+                [[ -z "$_grp" ]] && _grp=$(find "$_croot" -mindepth 1 -maxdepth 1 -type d \
                     -exec stat -c '%G' {} \; 2>/dev/null | grep -v '^root$' | head -1 || true)
                 if [[ -n "$_grp" ]] && getent group "$_grp" &>/dev/null; then
-                    # Change primary group (more reliable than supplementary for chroot SFTP)
+                    # Fix group ownership so all files/dirs belong to web group
+                    find "$_croot" -mindepth 1 -exec chown :"$_grp" {} \; 2>/dev/null || true
+                    # Fix primary + supplementary group for sftp_user
                     usermod -g "$_grp" "$_sfuser" 2>/dev/null || true
-                    # Also keep as supplementary for redundancy
                     usermod -aG "$_grp" "$_sfuser" 2>/dev/null || true
+                    # Fix PHP-FPM pool umask so PHP-created files are 660 not 644
+                    local _pver; _pver=$(grep "^PHP_VERSION=" "${SITES_META_DIR}/${_dom}.conf" \
+                        2>/dev/null | cut -d= -f2)
+                    if [[ -n "$_pver" ]]; then
+                        local _pool; _pool=$(get_php_pool_conf "$_pver" "$_dom")
+                        [[ -f "$_pool" ]] && _php_pool_set "$_pool" "umask" "0007" || true
+                    fi
                 fi
+                find "$_croot" -mindepth 1 -type d -exec chmod 770 {} \; 2>/dev/null || true
+                find "$_croot" -mindepth 1 -type f -exec chmod 660 {} \; 2>/dev/null || true
             fi
         elif [[ $_in_match -eq 1 && "$_line" =~ ^[^[:space:]] && -n "${_line//[[:space:]]/}" ]]; then
             _in_match=0; _sfuser=""
