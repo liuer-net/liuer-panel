@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.29"
+readonly VERSION="2.5.30"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -372,19 +372,41 @@ _set_site_perms() {
     # Reset top-level dir to root:root 755 — required for SFTP ChrootDirectory
     chown root:root "$site_dir" 2>/dev/null || true
     chmod 755 "$site_dir"
-    # If site has SFTP users, keep group-writable so they can upload
-    if grep -q "ChrootDirectory ${site_dir}" /etc/ssh/sshd_config 2>/dev/null; then
-        find "$site_dir" -mindepth 1 -type d -exec chmod 770 {} \;
-        find "$site_dir" -type f -exec chmod 660 {} \;
-    else
-        find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
-        find "$site_dir" -type f -exec chmod 640 {} \;
-    fi
+    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
+    find "$site_dir" -type f -exec chmod 640 {} \;
     # Add nginx to site group — restart required (not just reload) to apply new group
     if ! groups "$nginx_user" 2>/dev/null | grep -qw "$site_user"; then
         usermod -aG "$site_user" "$nginx_user" 2>/dev/null || true
         systemctl restart nginx 2>/dev/null || true
     fi
+}
+
+# Re-apply group-writable perms for all SFTP chroot dirs (run AFTER _set_site_perms)
+_repair_sftp_perms() {
+    local _sshd="/etc/ssh/sshd_config"
+    [[ -f "$_sshd" ]] || return 0
+    local _sfuser="" _in_match=0
+    while IFS= read -r _line; do
+        if [[ "$_line" =~ ^[[:space:]]*Match[[:space:]]+User[[:space:]]+([^[:space:]]+) ]]; then
+            _sfuser="${BASH_REMATCH[1]}"
+            _in_match=1
+        elif [[ $_in_match -eq 1 && "$_line" =~ ^[[:space:]]*ChrootDirectory[[:space:]]+([^[:space:]]+) ]]; then
+            local _croot="${BASH_REMATCH[1]}"
+            if [[ -d "$_croot" ]]; then
+                chown root:root "$_croot" && chmod 755 "$_croot"
+                find "$_croot" -mindepth 1 -type d -exec chmod 770 {} \; 2>/dev/null || true
+                find "$_croot" -mindepth 1 -type f -exec chmod 660 {} \; 2>/dev/null || true
+                # Re-ensure sftp_user is in the group owning files inside chroot
+                local _grp; _grp=$(find "$_croot" -mindepth 1 -maxdepth 1 -type d \
+                    -exec stat -c '%G' {} \; 2>/dev/null | grep -v '^root$' | head -1)
+                if [[ -n "$_grp" ]] && getent group "$_grp" &>/dev/null; then
+                    usermod -aG "$_grp" "$_sfuser" 2>/dev/null || true
+                fi
+            fi
+        elif [[ $_in_match -eq 1 && "$_line" =~ ^[^[:space:]] && -n "${_line//[[:space:]]/}" ]]; then
+            _in_match=0; _sfuser=""
+        fi
+    done < "$_sshd"
 }
 
 remove_php_pool() {
@@ -2609,6 +2631,7 @@ fix_permissions() {
         0) return ;;
         *) log_warn "Invalid selection." ;;
     esac
+    _repair_sftp_perms
     press_enter
 }
 
@@ -3253,6 +3276,8 @@ do_repair() {
         local _pma_u; _pma_u=$(cat "${CONFIG_DIR}/pma_user")
         [[ -n "$_pma_u" ]] && _set_site_perms /var/www/phpmyadmin "$_pma_u" || true
     fi
+    # Re-apply group-writable perms for SFTP users (must run after _set_site_perms resets to 750)
+    _repair_sftp_perms
 
     # 8. Fix SFTP: ensure Subsystem sftp uses internal-sftp + fix ChrootDirectory permissions
     local _sshd="/etc/ssh/sshd_config"
@@ -4111,26 +4136,9 @@ create_sftp_user() {
 
     echo "${_sfuser}:${_sfpass}" | chpasswd
 
-    # chroot requires: jail dir owned root:root, not writable by group/other, but executable (755)
-    chown root:root "$_sfsite"
-    chmod 755 "$_sfsite"
-
-    local _web_root; _web_root=$(grep 'WEB_ROOT=' "${SITES_META_DIR}/${_sfdom}.conf" 2>/dev/null \
-                                  | cut -d= -f2 || echo "${_sfsite}/public_html")
     local _web_user; _web_user=$(grep 'WEB_USER=' "${SITES_META_DIR}/${_sfdom}.conf" 2>/dev/null \
                                   | cut -d= -f2)
-
-    # Add SFTP user to site's web_user group so it can read/write without taking ownership
-    # This preserves PHP-FPM and nginx access
-    if [[ -n "$_web_user" ]]; then
-        usermod -aG "$_web_user" "$_sfuser" 2>/dev/null || true
-        # Make web_root group-writable so SFTP user can upload files
-        find "$_web_root" -type d -exec chmod 770 {} \; 2>/dev/null || true
-        find "$_web_root" -type f -exec chmod 660 {} \; 2>/dev/null || true
-    else
-        chown -R "${_sfuser}:${_sfuser}" "$_web_root" 2>/dev/null || true
-        chmod 755 "$_web_root" 2>/dev/null || true
-    fi
+    [[ -n "$_web_user" ]] && usermod -aG "$_web_user" "$_sfuser" 2>/dev/null || true
 
     # Ensure Subsystem sftp uses internal-sftp (required for ChrootDirectory + ForceCommand)
     local _sshd="/etc/ssh/sshd_config"
@@ -4153,6 +4161,9 @@ Match User ${_sfuser}
     X11Forwarding no
 EOF
     fi
+
+    # Fix chroot + group-writable perms via shared function
+    _repair_sftp_perms
 
     # Restart sshd (not just reload) to apply Subsystem change
     systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
