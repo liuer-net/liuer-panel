@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.33"
+readonly VERSION="2.5.34"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1744,9 +1744,36 @@ toggle_http_protocol() {
                 log_warn "Nginx ${_nginx_ver} < 1.25 — HTTP/3 not supported. Run repair to upgrade."
                 press_enter; return
             fi
+            if ! nginx -V 2>&1 | grep -q 'http_v3_module'; then
+                log_warn "Nginx is not compiled with http_v3_module. Run repair to reinstall mainline."
+                press_enter; return
+            fi
             [[ "$_cur" == "HTTP/3" ]] && { log_info "Already HTTP/3."; press_enter; return; }
+            local _backup; _backup=$(mktemp)
+            cp "$_conf" "$_backup"
             _nginx_remove_h2_h3 "$_conf"
-            sed -i '/listen 443 ssl/a\    http2 on;\n    http3 on;\n    listen 443 quic reuseport;\n    add_header Alt-Svc '"'"'h3=":443"; ma=86400'"'"';' "$_conf"
+            # reuseport must appear only once across all configs
+            local _quic_listen="    listen 443 quic reuseport;"
+            grep -r "listen.*quic.*reuseport" /etc/nginx/ 2>/dev/null | grep -qv "^${_conf}:" \
+                && _quic_listen="    listen 443 quic;"
+            # Insert H2+H3 directives after the SSL listen line
+            local _tmpf; _tmpf=$(mktemp)
+            while IFS= read -r _l; do
+                echo "$_l"
+                if echo "$_l" | grep -q 'listen 443 ssl'; then
+                    echo "    http2 on;"
+                    echo "    http3 on;"
+                    echo "$_quic_listen"
+                    echo "    add_header Alt-Svc 'h3=\":443\"; ma=86400';"
+                fi
+            done < "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            if ! nginx -t &>/dev/null; then
+                cp "$_backup" "$_conf"
+                local _err; _err=$(nginx -t 2>&1 | tail -3)
+                log_error "Nginx config invalid — rolled back.\n${_err}"
+                rm -f "$_backup"; press_enter; return
+            fi
+            rm -f "$_backup"
             # Open UDP 443 in firewall
             if command -v firewall-cmd &>/dev/null; then
                 firewall-cmd --permanent --add-port=443/udp &>/dev/null || true
@@ -2179,9 +2206,27 @@ change_php_version() {
 
     [[ "$old_socket" == "$new_socket" ]] && { log_info "Website is already using PHP $new_php."; return 0; }
 
-    sed -i "s|fastcgi_pass unix:${old_socket}|fastcgi_pass unix:${new_socket}|g" "$nginx_conf"
-
     local meta="${SITES_META_DIR}/${domain}.conf"
+    local old_php; old_php=$(grep "^PHP_VERSION=" "$meta" 2>/dev/null | cut -d= -f2)
+    local site_user; site_user=$(grep "^WEB_USER=" "$meta" 2>/dev/null | cut -d= -f2)
+    local site_path; site_path=$(grep "^SITE_DIR=" "$meta" 2>/dev/null | cut -d= -f2)
+    local old_pool; old_pool=$(get_php_pool_conf "$old_php" "$domain")
+
+    # Create new PHP-FPM pool for the new version
+    create_php_pool "$new_php" "$domain" "$site_user" 0 "$site_path"
+
+    # Copy custom upload/timeout settings from old pool to new pool
+    if [[ -n "$old_php" && -f "$old_pool" ]]; then
+        local new_pool; new_pool=$(get_php_pool_conf "$new_php" "$domain")
+        for _k in "php_admin_value[upload_max_filesize]" "php_admin_value[post_max_size]" \
+                  "php_value[memory_limit]" "php_admin_value[max_execution_time]" \
+                  "php_admin_value[max_input_time]" "umask"; do
+            local _v; _v=$(grep "^${_k} = " "$old_pool" 2>/dev/null | cut -d= -f2- | xargs)
+            [[ -n "$_v" ]] && _php_pool_set "$new_pool" "$_k" "$_v" || true
+        done
+    fi
+
+    sed -i "s|fastcgi_pass unix:${old_socket}|fastcgi_pass unix:${new_socket}|g" "$nginx_conf"
     [[ -f "$meta" ]] && sed -i "s|^PHP_VERSION=.*|PHP_VERSION=${new_php}|" "$meta"
 
     if ! nginx -t &>/dev/null; then
@@ -2190,7 +2235,9 @@ change_php_version() {
         return 1
     fi
     nginx -s reload
-    log_success "Switched ${domain} to PHP $new_php."
+    local new_svc; new_svc=$(get_php_service "$new_php")
+    systemctl restart "$new_svc" 2>/dev/null || true
+    log_success "Switched ${domain} to PHP $new_php. Upload/timeout settings carried over."
     press_enter
 }
 
