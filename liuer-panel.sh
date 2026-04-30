@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.40"
+readonly VERSION="2.5.41"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2040,6 +2040,57 @@ toggle_php_hardening() {
 
     local svc; svc=$(get_php_service "$_php_ver")
     systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+    press_enter
+}
+
+toggle_static_cache() {
+    print_section "STATIC ASSET CACHING"
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
+
+    local _cur="disabled"
+    grep -q '# liuer-static-cache-start' "$_conf" && _cur="enabled"
+
+    echo -e "\n  Site         : ${BOLD}${domain}${NC}"
+    echo -e "  Static cache : ${GREEN}${_cur}${NC}\n"
+    echo "  1) Enable  — cache JS/CSS/images 1 year (Cache-Control: immutable)"
+    echo "  2) Disable — remove caching block"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+
+    case "$_ch" in
+        1)
+            [[ "$_cur" == "enabled" ]] && { log_warn "Static cache already enabled."; press_enter; return; }
+            local _tmpf; _tmpf=$(mktemp)
+            awk '/location ~ \/\\./{
+                if (!ins) {
+                    print "    # liuer-static-cache-start"
+                    print "    location ~* \\.(png|jpg|webp|gif|jpeg|zip|css|svg|js|pdf|woff2|ttf|eot|otf|ico|mp4|webm)$ {"
+                    print "        add_header Cache-Control \"public, max-age=31536000, immutable\";"
+                    print "        access_log off;"
+                    print "    }"
+                    print "    # liuer-static-cache-end"
+                    print ""
+                    ins=1
+                }
+            } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            log_success "Static asset caching enabled for ${domain}." ;;
+        2)
+            [[ "$_cur" == "disabled" ]] && { log_warn "Static cache already disabled."; press_enter; return; }
+            local _tmpf; _tmpf=$(mktemp)
+            awk '/# liuer-static-cache-start/{skip=1} skip && /# liuer-static-cache-end/{skip=0; next} !skip' \
+                "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            # Remove blank line left behind
+            sed -i '/^[[:space:]]*$/{ N; /^\n[[:space:]]*$/d }' "$_conf" 2>/dev/null || true
+            log_success "Static asset caching disabled for ${domain}." ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
     press_enter
 }
 
@@ -4539,6 +4590,7 @@ menu_website() {
         echo "  12  SSL management"
         echo "  13  PHP URL routing"
         echo "  14  Gzip compression"
+        echo "  15  Static asset caching"
         _sub_footer; read -r _ch
         case "$_ch" in
             1)  create_website ;;
@@ -4555,6 +4607,7 @@ menu_website() {
             12) manage_site_ssl ;;
             13) toggle_php_routing ;;
             14) toggle_gzip ;;
+            15) toggle_static_cache ;;
             0)  return ;;
             *)  log_warn "Invalid selection." ;;
         esac
