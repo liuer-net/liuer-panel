@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.35"
+readonly VERSION="2.5.36"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -668,10 +668,10 @@ EOF
 }
 
 nginx_tpl_php() {
-    local domain="$1" root="$2" socket="$3" routing="${4:-0}"
+    local domain="$1" root="$2" socket="$3" routing="${4:-0}" index_file="${5:-index.php}"
     local _try
     [[ "$routing" == "1" ]] \
-        && _try='try_files $uri $uri/ /index.php?$query_string;' \
+        && _try="try_files \$uri \$uri/ /${index_file}?\$query_string;" \
         || _try='try_files $uri $uri/ =404;'
     cat <<EOF
 server {
@@ -679,7 +679,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
-    index index.php index.html;
+    index ${index_file} index.html;
 
     access_log /var/log/nginx/${domain}_access.log;
     error_log  /var/log/nginx/${domain}_error.log warn;
@@ -694,7 +694,7 @@ server {
 
     location ~ \.php$ {
         fastcgi_pass unix:${socket};
-        fastcgi_index index.php;
+        fastcgi_index ${index_file};
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
     }
@@ -1271,13 +1271,16 @@ create_website() {
         1) # PHP plain
             type_name="php"
             echo ""
-            echo -e "  ${BOLD}URL routing (try_files → index.php)?${NC}"
+            echo -e "  ${BOLD}Entry/index file?${NC} [Enter for index.php]: \c"; read -r _idx_file
+            [[ -z "$_idx_file" ]] && _idx_file="index.php"
+            echo ""
+            echo -e "  ${BOLD}URL routing (try_files → ${_idx_file})?${NC}"
             echo "  1) Yes — app uses routing (/about, /products/...)"
             echo "  2) No  — direct file access only (default)"
             echo -e "${YELLOW}Select [1/2]:${NC} \c"; read -r _rt_opt
             local _php_routing=0
             [[ "$_rt_opt" == "1" ]] && _php_routing=1
-            cat > "${web_root}/index.php" <<'PHP'
+            cat > "${web_root}/${_idx_file}" <<'PHP'
 <?php echo "<h1>PHP site is ready!</h1>"; phpinfo();
 PHP
             ;;
@@ -1525,7 +1528,7 @@ HTML
     # --- Nginx config ---
     local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
     case "$site_type" in
-        1) nginx_tpl_php       "$domain" "$web_root" "$socket" "${_php_routing:-0}" > "$nginx_conf" ;;
+        1) nginx_tpl_php       "$domain" "$web_root" "$socket" "${_php_routing:-0}" "${_idx_file:-index.php}" > "$nginx_conf" ;;
         2) nginx_tpl_laravel   "$domain" "$web_root" "$socket" > "$nginx_conf" ;;
         3) nginx_tpl_wordpress "$domain" "$web_root" "$socket" > "$nginx_conf" ;;
         4) nginx_tpl_static    "$domain" "$web_root"           > "$nginx_conf" ;;
@@ -1544,6 +1547,7 @@ HTML
 DOMAIN=${domain}
 TYPE=${type_name}
 PHP_VERSION=${php_ver}
+INDEX_FILE=${_idx_file:-index.php}
 WEB_ROOT=${web_root}
 SITE_DIR=${site_dir}
 WEB_USER=${site_user}
@@ -2057,23 +2061,43 @@ toggle_php_routing() {
         press_enter; return
     fi
 
-    local _cur="disabled"
-    grep -q 'try_files.*index\.php' "$_conf" && _cur="enabled"
+    # Read current index file: prefer meta, fallback to fastcgi_index in nginx config
+    local _idx; _idx=$(grep "^INDEX_FILE=" "$_meta" 2>/dev/null | cut -d= -f2)
+    [[ -z "$_idx" ]] && _idx=$(grep 'fastcgi_index' "$_conf" | awk '{print $2}' | tr -d ';' | head -1)
+    [[ -z "$_idx" ]] && _idx="index.php"
 
-    echo -e "\n  Site    : ${BOLD}${domain}${NC}"
-    echo -e "  Routing : ${GREEN}${_cur}${NC}\n"
-    echo "  1) Enable  — app uses routing (/about, /products/...)"
-    echo "  2) Disable — direct file access only"
+    local _cur="disabled"
+    grep -q 'try_files.*\.php' "$_conf" && _cur="enabled"
+
+    echo -e "\n  Site       : ${BOLD}${domain}${NC}"
+    echo -e "  Routing    : ${GREEN}${_cur}${NC}"
+    echo -e "  Index file : ${BOLD}${_idx}${NC}\n"
+    echo "  1) Enable routing"
+    echo "  2) Disable routing"
+    echo "  3) Change index/entry file (current: ${_idx})"
     echo "  0) Cancel"
     echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
 
     case "$_ch" in
         1)
-            sed -i "s|try_files \\\$uri \\\$uri/ =404;|try_files \$uri \$uri/ /index.php?\$query_string;|" "$_conf"
-            log_success "URL routing enabled for ${domain}." ;;
+            sed -i "s|try_files \\\$uri \\\$uri/ =404;|try_files \$uri \$uri/ /${_idx}?\$query_string;|" "$_conf"
+            log_success "URL routing enabled for ${domain} (entry: ${_idx})." ;;
         2)
-            sed -i "s|try_files \\\$uri \\\$uri/ /index\.php?.*|try_files \$uri \$uri/ =404;|" "$_conf"
+            sed -i "s|try_files \\\$uri \\\$uri/ /[^ ]*?[^;]*;|try_files \$uri \$uri/ =404;|" "$_conf"
             log_success "URL routing disabled for ${domain}." ;;
+        3)
+            echo -e "  New index/entry file [Enter for ${_idx}]: \c"; read -r _new_idx
+            [[ -z "$_new_idx" ]] && { log_warn "No change."; press_enter; return; }
+            # Update fastcgi_index, index directive, and try_files if routing is enabled
+            sed -i "s|fastcgi_index [^;]*;|fastcgi_index ${_new_idx};|g" "$_conf"
+            sed -i "s|index [^ ]* index\.html;|index ${_new_idx} index.html;|" "$_conf"
+            if [[ "$_cur" == "enabled" ]]; then
+                sed -i "s|try_files \\\$uri \\\$uri/ /[^ ]*?[^;]*;|try_files \$uri \$uri/ /${_new_idx}?\$query_string;|" "$_conf"
+            fi
+            grep -q "^INDEX_FILE=" "$_meta" \
+                && sed -i "s|^INDEX_FILE=.*|INDEX_FILE=${_new_idx}|" "$_meta" \
+                || echo "INDEX_FILE=${_new_idx}" >> "$_meta"
+            log_success "Index file updated to ${_new_idx}." ;;
         0) return ;;
         *) log_warn "Invalid selection."; press_enter; return ;;
     esac
