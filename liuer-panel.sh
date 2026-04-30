@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.23"
+readonly VERSION="2.5.24"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -371,7 +371,11 @@ _set_site_perms() {
     chown -R "${site_user}:${site_user}" "$site_dir"
     find "$site_dir" -type d -exec chmod 750 {} \;
     find "$site_dir" -type f -exec chmod 640 {} \;
-    usermod -aG "$site_user" "$nginx_user" 2>/dev/null || true
+    # Add nginx to site group — restart required (not just reload) to apply new group
+    if ! groups "$nginx_user" 2>/dev/null | grep -qw "$site_user"; then
+        usermod -aG "$site_user" "$nginx_user" 2>/dev/null || true
+        systemctl restart nginx 2>/dev/null || true
+    fi
 }
 
 remove_php_pool() {
@@ -4069,14 +4073,26 @@ create_sftp_user() {
 
     echo "${_sfuser}:${_sfpass}" | chpasswd
 
-    # chroot requires: jail dir owned root:root, NOT writable by group/other, but must be executable (755)
+    # chroot requires: jail dir owned root:root, not writable by group/other, but executable (755)
     chown root:root "$_sfsite"
     chmod 755 "$_sfsite"
+
     local _web_root; _web_root=$(grep 'WEB_ROOT=' "${SITES_META_DIR}/${_sfdom}.conf" 2>/dev/null \
                                   | cut -d= -f2 || echo "${_sfsite}/public_html")
-    # Give SFTP user ownership of web root so they can read/write files
-    chown -R "${_sfuser}:${_sfuser}" "$_web_root" 2>/dev/null || true
-    chmod 755 "$_web_root" 2>/dev/null || true
+    local _web_user; _web_user=$(grep 'WEB_USER=' "${SITES_META_DIR}/${_sfdom}.conf" 2>/dev/null \
+                                  | cut -d= -f2)
+
+    # Add SFTP user to site's web_user group so it can read/write without taking ownership
+    # This preserves PHP-FPM and nginx access
+    if [[ -n "$_web_user" ]]; then
+        usermod -aG "$_web_user" "$_sfuser" 2>/dev/null || true
+        # Make web_root group-writable so SFTP user can upload files
+        find "$_web_root" -type d -exec chmod 770 {} \; 2>/dev/null || true
+        find "$_web_root" -type f -exec chmod 660 {} \; 2>/dev/null || true
+    else
+        chown -R "${_sfuser}:${_sfuser}" "$_web_root" 2>/dev/null || true
+        chmod 755 "$_web_root" 2>/dev/null || true
+    fi
 
     # Add SFTP block to sshd_config if not already there
     local _sshd="/etc/ssh/sshd_config"
