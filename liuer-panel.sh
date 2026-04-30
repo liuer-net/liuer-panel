@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.34"
+readonly VERSION="2.5.35"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -668,7 +668,11 @@ EOF
 }
 
 nginx_tpl_php() {
-    local domain="$1" root="$2" socket="$3"
+    local domain="$1" root="$2" socket="$3" routing="${4:-0}"
+    local _try
+    [[ "$routing" == "1" ]] \
+        && _try='try_files $uri $uri/ /index.php?$query_string;' \
+        || _try='try_files $uri $uri/ =404;'
     cat <<EOF
 server {
     listen 80;
@@ -686,7 +690,7 @@ server {
         allow all;
     }
 
-    location / { try_files \$uri \$uri/ =404; }
+    location / { ${_try} }
 
     location ~ \.php$ {
         fastcgi_pass unix:${socket};
@@ -1266,6 +1270,13 @@ create_website() {
     case "$site_type" in
         1) # PHP plain
             type_name="php"
+            echo ""
+            echo -e "  ${BOLD}URL routing (try_files → index.php)?${NC}"
+            echo "  1) Yes — app uses routing (/about, /products/...)"
+            echo "  2) No  — direct file access only (default)"
+            echo -e "${YELLOW}Select [1/2]:${NC} \c"; read -r _rt_opt
+            local _php_routing=0
+            [[ "$_rt_opt" == "1" ]] && _php_routing=1
             cat > "${web_root}/index.php" <<'PHP'
 <?php echo "<h1>PHP site is ready!</h1>"; phpinfo();
 PHP
@@ -1514,7 +1525,7 @@ HTML
     # --- Nginx config ---
     local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
     case "$site_type" in
-        1) nginx_tpl_php       "$domain" "$web_root" "$socket" > "$nginx_conf" ;;
+        1) nginx_tpl_php       "$domain" "$web_root" "$socket" "${_php_routing:-0}" > "$nginx_conf" ;;
         2) nginx_tpl_laravel   "$domain" "$web_root" "$socket" > "$nginx_conf" ;;
         3) nginx_tpl_wordpress "$domain" "$web_root" "$socket" > "$nginx_conf" ;;
         4) nginx_tpl_static    "$domain" "$web_root"           > "$nginx_conf" ;;
@@ -2028,6 +2039,46 @@ toggle_php_hardening() {
 
     local svc; svc=$(get_php_service "$_php_ver")
     systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+    press_enter
+}
+
+toggle_php_routing() {
+    print_section "PHP URL ROUTING"
+    SELECTED_DOMAIN=""
+    _select_domain "Select PHP site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
+
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _type; _type=$(grep "^TYPE=" "$_meta" 2>/dev/null | cut -d= -f2)
+    if [[ "$_type" != "php" ]]; then
+        log_warn "URL routing toggle is only for PHP sites (not ${_type:-unknown})."
+        press_enter; return
+    fi
+
+    local _cur="disabled"
+    grep -q 'try_files.*index\.php' "$_conf" && _cur="enabled"
+
+    echo -e "\n  Site    : ${BOLD}${domain}${NC}"
+    echo -e "  Routing : ${GREEN}${_cur}${NC}\n"
+    echo "  1) Enable  — app uses routing (/about, /products/...)"
+    echo "  2) Disable — direct file access only"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+
+    case "$_ch" in
+        1)
+            sed -i "s|try_files \\\$uri \\\$uri/ =404;|try_files \$uri \$uri/ /index.php?\$query_string;|" "$_conf"
+            log_success "URL routing enabled for ${domain}." ;;
+        2)
+            sed -i "s|try_files \\\$uri \\\$uri/ /index\.php?.*|try_files \$uri \$uri/ =404;|" "$_conf"
+            log_success "URL routing disabled for ${domain}." ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
     press_enter
 }
 
@@ -4410,6 +4461,7 @@ menu_website() {
         echo "  10  View logs"
         echo "  11  Upload & timeout settings"
         echo "  12  SSL management"
+        echo "  13  PHP URL routing"
         _sub_footer; read -r _ch
         case "$_ch" in
             1)  create_website ;;
@@ -4424,6 +4476,7 @@ menu_website() {
             10) view_site_logs ;;
             11) manage_upload_settings ;;
             12) manage_site_ssl ;;
+            13) toggle_php_routing ;;
             0)  return ;;
             *)  log_warn "Invalid selection." ;;
         esac
