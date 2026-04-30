@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.26"
+readonly VERSION="2.5.27"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -3245,7 +3245,21 @@ do_repair() {
         [[ -n "$_pma_u" ]] && _set_site_perms /var/www/phpmyadmin "$_pma_u" || true
     fi
 
-    # 8. Reload nginx
+    # 8. Fix SFTP: ensure Subsystem sftp uses internal-sftp (required for ChrootDirectory)
+    local _sshd="/etc/ssh/sshd_config"
+    if [[ -f "$_sshd" ]]; then
+        if grep -qP '^\s*Subsystem\s+sftp\s+(?!internal-sftp)' "$_sshd" 2>/dev/null; then
+            sed -i 's|^\s*Subsystem\s\+sftp\s\+.*|Subsystem sftp internal-sftp|' "$_sshd"
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+            log_success "Fixed: Subsystem sftp → internal-sftp"
+        elif ! grep -q 'Subsystem sftp' "$_sshd"; then
+            echo "Subsystem sftp internal-sftp" >> "$_sshd"
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+            log_success "Added: Subsystem sftp internal-sftp"
+        fi
+    fi
+
+    # 9. Reload nginx
     if nginx -t &>/dev/null; then
         nginx -s reload && log_success "Nginx reloaded." || true
     else
