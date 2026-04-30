@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.27"
+readonly VERSION="2.5.28"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -369,7 +369,10 @@ _set_site_perms() {
         chmod 755 "$_parent"
     fi
     chown -R "${site_user}:${site_user}" "$site_dir"
-    find "$site_dir" -type d -exec chmod 750 {} \;
+    # Reset top-level dir to root:root 755 — required for SFTP ChrootDirectory
+    chown root:root "$site_dir" 2>/dev/null || true
+    chmod 755 "$site_dir"
+    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
     find "$site_dir" -type f -exec chmod 640 {} \;
     # Add nginx to site group — restart required (not just reload) to apply new group
     if ! groups "$nginx_user" 2>/dev/null | grep -qw "$site_user"; then
@@ -3245,18 +3248,33 @@ do_repair() {
         [[ -n "$_pma_u" ]] && _set_site_perms /var/www/phpmyadmin "$_pma_u" || true
     fi
 
-    # 8. Fix SFTP: ensure Subsystem sftp uses internal-sftp (required for ChrootDirectory)
+    # 8. Fix SFTP: ensure Subsystem sftp uses internal-sftp + fix ChrootDirectory permissions
     local _sshd="/etc/ssh/sshd_config"
     if [[ -f "$_sshd" ]]; then
+        local _sshd_changed=0
         if grep -qP '^\s*Subsystem\s+sftp\s+(?!internal-sftp)' "$_sshd" 2>/dev/null; then
             sed -i 's|^\s*Subsystem\s\+sftp\s\+.*|Subsystem sftp internal-sftp|' "$_sshd"
-            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+            _sshd_changed=1
             log_success "Fixed: Subsystem sftp → internal-sftp"
         elif ! grep -q 'Subsystem sftp' "$_sshd"; then
             echo "Subsystem sftp internal-sftp" >> "$_sshd"
-            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+            _sshd_changed=1
             log_success "Added: Subsystem sftp internal-sftp"
         fi
+        # Fix ChrootDirectory permissions: must be root:root 755 or sshd drops connection
+        while IFS= read -r _cline; do
+            local _cdir; _cdir=$(echo "$_cline" | awk '{print $2}')
+            if [[ -n "$_cdir" && -d "$_cdir" ]]; then
+                local _cur_own; _cur_own=$(stat -c '%U:%G' "$_cdir" 2>/dev/null)
+                if [[ "$_cur_own" != "root:root" ]]; then
+                    chown root:root "$_cdir"
+                    chmod 755 "$_cdir"
+                    log_success "Fixed chroot perms: $_cdir (was ${_cur_own})"
+                    _sshd_changed=1
+                fi
+            fi
+        done < <(grep -i '^\s*ChrootDirectory' "$_sshd" 2>/dev/null)
+        [[ "$_sshd_changed" -eq 1 ]] && { systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true; }
     fi
 
     # 9. Reload nginx
