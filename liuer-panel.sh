@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.36"
+readonly VERSION="2.5.37"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -4328,7 +4328,7 @@ list_sftp_users() {
         local _u _d
         _u=$(echo "$line" | grep -oP '(?<=Match User )\S+')
         [[ -z "$_u" ]] && continue
-        _d=$(grep -A1 "Match User ${_u}" /etc/ssh/sshd_config 2>/dev/null | grep ChrootDirectory | awk '{print $2}')
+        _d=$(grep -A5 "Match User ${_u}" /etc/ssh/sshd_config 2>/dev/null | grep ChrootDirectory | awk '{print $2}')
         # Only show panel-managed SFTP users (chroot under /home/web/ or legacy /var/www/)
         [[ "$_d" == "/home/web/"* || "$_d" == "/var/www/"* ]] || continue
         printf "  %-20s → %s\n" "$_u" "${_d:-unknown}"
@@ -4349,7 +4349,7 @@ delete_sftp_user() {
     while IFS= read -r _line; do
         local _su; _su=$(echo "$_line" | grep -oP '(?<=Match User )\S+')
         [[ -z "$_su" ]] && continue
-        local _sd; _sd=$(grep -A1 "Match User ${_su}" /etc/ssh/sshd_config 2>/dev/null \
+        local _sd; _sd=$(grep -A5 "Match User ${_su}" /etc/ssh/sshd_config 2>/dev/null \
                          | grep ChrootDirectory | awk '{print $2}')
         [[ "$_sd" == "/home/web/"* || "$_sd" == "/var/www/"* ]] || continue
         if [[ -n "$_filter_domain" ]]; then
@@ -4541,7 +4541,7 @@ manage_site_users() {
         while IFS= read -r _line; do
             local _su; _su=$(echo "$_line" | grep -oP '(?<=Match User )\S+')
             [[ -z "$_su" ]] && continue
-            local _sd; _sd=$(grep -A1 "Match User ${_su}" /etc/ssh/sshd_config 2>/dev/null \
+            local _sd; _sd=$(grep -A5 "Match User ${_su}" /etc/ssh/sshd_config 2>/dev/null \
                              | grep ChrootDirectory | awk '{print $2}')
             [[ "$_sd" == "$(get_site_dir "$domain")" || "$_sd" == "/var/www/${domain}" ]] || continue
             printf "  %-20s → %s\n" "$_su" "$_sd"
