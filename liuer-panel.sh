@@ -3066,14 +3066,18 @@ show_version() {
     echo ""
 }
 
+_fetch_remote_ver() {
+    local ver_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/version.txt"
+    local v
+    v=$(curl -fsSL --max-time 10 "$ver_url" 2>/dev/null | tr -d '[:space:]')
+    echo "$v"
+}
+
 check_update() {
     print_section "CHECK FOR UPDATES"
 
-    local raw_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/${SCRIPT_NAME}"
     log_info "Fetching remote version..."
-    local remote_ver
-    remote_ver=$(curl -fsSL --max-time 10 "$raw_url" 2>/dev/null \
-                 | grep -oP '(?<=readonly VERSION=")[^"]+' | head -1 || true)
+    local remote_ver; remote_ver=$(_fetch_remote_ver)
 
     if [[ -z "$remote_ver" ]]; then
         log_error "Cannot reach GitHub. Check your internet connection."
@@ -3083,8 +3087,8 @@ check_update() {
     if [[ "$remote_ver" == "$VERSION" ]]; then
         log_success "You are running the latest version (v${VERSION})."
     else
-        echo -e "${YELLOW}New version available: ${BOLD}v${remote_ver}${NC}  (current: v${VERSION})"
-        echo -e "Run 'liuer update' to upgrade."
+        echo -e "  New version available: ${BOLD}${GREEN}v${remote_ver}${NC}  ${DIM}(current: v${VERSION})${NC}"
+        echo -e "  Run ${BOLD}liuer update${NC} to upgrade."
     fi
     press_enter
 }
@@ -3096,9 +3100,7 @@ update_tool() {
     local target="${INSTALL_DIR}/${SCRIPT_NAME}"
 
     log_info "Fetching remote version..."
-    local remote_ver
-    remote_ver=$(curl -fsSL --max-time 10 "$raw_url" 2>/dev/null \
-                 | grep -oP '(?<=readonly VERSION=")[^"]+' | head -1 || true)
+    local remote_ver; remote_ver=$(_fetch_remote_ver)
 
     if [[ -z "$remote_ver" ]]; then
         log_error "Cannot reach GitHub. Check your internet connection."
@@ -3110,37 +3112,39 @@ update_tool() {
         press_enter; return 0
     fi
 
-    echo -e "${BOLD}Updating: v${VERSION}${NC} → ${BOLD}v${remote_ver}${NC}\n"
+    echo -e "  Updating: ${DIM}v${VERSION}${NC} → ${BOLD}${GREEN}v${remote_ver}${NC}\n"
     confirm_action "Proceed with update?" || { log_info "Cancelled."; return 0; }
 
     local backup_path="/tmp/liuer-panel-backup-$(date +%Y%m%d_%H%M%S).sh"
-    log_info "Backing up current script to: $backup_path"
+    log_info "Backing up current script → $backup_path"
     cp "$target" "$backup_path" \
         || { log_error "Backup failed. Aborting."; return 1; }
 
     log_info "Downloading v${remote_ver}..."
-    if curl -fsSL --max-time 60 "$raw_url" -o "${target}.tmp" 2>/dev/null \
-       && [[ -s "${target}.tmp" ]] \
-       && grep -q 'readonly VERSION=' "${target}.tmp"; then
+    curl -fsSL --max-time 120 "$raw_url" -o "${target}.tmp"
+    local dl_rc=$?
+
+    if [[ $dl_rc -eq 0 && -s "${target}.tmp" && \
+          $(grep -c 'readonly VERSION=' "${target}.tmp" 2>/dev/null) -gt 0 ]]; then
         mv "${target}.tmp" "$target"
         chmod +x "$target"
         ln -sf "$target" "$BIN_LINK"
         rm -f "$backup_path"
-        log_success "Update successful! Now running v${remote_ver}."
+        log_success "Updated to v${remote_ver}."
         log_info "Applying post-update system fixes..."
         bash "$target" _repair_auto 2>/dev/null || true
         echo ""
-        log_info "Restarting liuer with new version..."
+        log_info "Restarting with new version..."
         sleep 1
         exec "$BIN_LINK"
     else
         rm -f "${target}.tmp"
-        log_error "Download failed! Restoring backup..."
+        log_error "Download failed (curl exit: ${dl_rc}). Restoring backup..."
         cp "$backup_path" "$target" \
             && log_success "Rollback successful." \
             || log_error "Rollback failed! Restore manually from: $backup_path"
+        press_enter
     fi
-    press_enter
 }
 
 do_repair() {
