@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.20"
+readonly VERSION="2.5.21"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1496,9 +1496,9 @@ EOF
     echo -e "${BOLD}SSL setup:${NC}"
     echo "  1) Free — Let's Encrypt"
     echo "  2) Paid — custom certificate"
-    echo "  3) Skip"
+    echo "  0) Skip"
     local _ssl_choice
-    echo -e "${YELLOW}Select [1-3]:${NC} \c"; read -r _ssl_choice
+    echo -e "${YELLOW}Select [0-2]:${NC} \c"; read -r _ssl_choice
     case "$_ssl_choice" in
         1) setup_ssl_free "$domain" && ssl_status="Let's Encrypt" ;;
         2) setup_ssl_paid "$domain" && ssl_status="Custom cert" ;;
@@ -1538,13 +1538,23 @@ setup_ssl_free() {
     if [[ -f "$ssl_email_file" ]]; then
         ssl_email=$(cat "$ssl_email_file")
         log_info "Using saved SSL email: ${ssl_email}"
+        echo -e "  ${DIM}(Enter new email to change, or press Enter to keep)${NC}"
+        echo -ne "  Email [${ssl_email}]: "; read -r _new_email
+        _new_email=$(echo "$_new_email" | xargs 2>/dev/null || echo "$_new_email")
+        if [[ -n "$_new_email" ]]; then
+            ssl_email="$_new_email"
+            echo "$ssl_email" > "$ssl_email_file"
+            chmod 600 "$ssl_email_file"
+        fi
     else
         while true; do
-            echo -e "${BOLD}Email for Let's Encrypt (or 0 to cancel):${NC} \c"
+            echo -e "${BOLD}Email for Let's Encrypt${NC} ${DIM}(0 to cancel)${NC}: \c"
             read -r ssl_email
-            [[ "$ssl_email" == "0" ]] && return 1
-            [[ "$ssl_email" =~ ^[^@]+@[^@]+\.[^@]+$ ]] && break
-            log_warn "Invalid email format."
+            # trim whitespace
+            ssl_email=$(echo "$ssl_email" | xargs 2>/dev/null || echo "$ssl_email")
+            [[ "$ssl_email" == "0" || "$ssl_email" == "q" ]] && return 1
+            [[ "$ssl_email" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]] && break
+            log_warn "Invalid email format. Example: you@example.com"
         done
         echo "$ssl_email" > "$ssl_email_file"
         chmod 600 "$ssl_email_file"
