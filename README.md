@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.5.19-blue.svg)](https://github.com/liuer-net/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.5.20-blue.svg)](https://github.com/liuer-net/liuer-panel/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A lightweight CLI-based web server control panel for Linux servers. Manage websites, databases, SSL, PHP versions, backups, and more — all from your terminal.

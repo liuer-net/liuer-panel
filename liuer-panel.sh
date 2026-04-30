@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.19"
+readonly VERSION="2.5.20"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -3069,7 +3069,9 @@ show_version() {
 _fetch_remote_ver() {
     local ver_url="https://raw.githubusercontent.com/liuer-net/liuer-panel/main/version.txt?$(date +%s)"
     local v
-    v=$(curl -fsSL --max-time 10 "$ver_url" 2>/dev/null | tr -d '[:space:]')
+    v=$(curl -fsSL --max-time 10 \
+        -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
+        "$ver_url" 2>/dev/null | tr -d '[:space:]')
     echo "$v"
 }
 
@@ -3121,7 +3123,9 @@ update_tool() {
         || { log_error "Backup failed. Aborting."; return 1; }
 
     log_info "Downloading v${remote_ver}..."
-    curl -fsSL --max-time 120 "$raw_url" -o "${target}.tmp"
+    curl -fsSL --max-time 120 \
+        -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
+        "$raw_url" -o "${target}.tmp"
     local dl_rc=$?
 
     if [[ $dl_rc -eq 0 && -s "${target}.tmp" && \
