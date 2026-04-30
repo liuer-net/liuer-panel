@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.37"
+readonly VERSION="2.5.38"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -27,6 +27,7 @@ readonly WWW_DIR="/home/web"
 readonly LOG_FILE="/var/log/liuer-panel.log"
 readonly REPO_URL="https://github.com/liuer-net/liuer-panel"
 readonly WEB_USERS_FILE="${CONFIG_DIR}/web_users.txt"
+readonly SFTP_USERS_FILE="${CONFIG_DIR}/sftp_users.txt"
 readonly DANGEROUS_FUNCTIONS="exec,shell_exec,system,passthru,popen,proc_open,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,dl,putenv,show_source,highlight_file"
 
 # =============================================================================
@@ -4282,6 +4283,10 @@ create_sftp_user() {
     fi
 
     echo "${_sfuser}:${_sfpass}" | chpasswd
+    # Save encrypted password for later display
+    touch "$SFTP_USERS_FILE" && chmod 600 "$SFTP_USERS_FILE"
+    sed -i "/^${_sfuser}|/d" "$SFTP_USERS_FILE" 2>/dev/null || true
+    echo "${_sfuser}|$(encrypt_pass "$_sfpass")|${_sfdom}" >> "$SFTP_USERS_FILE"
 
     # Ensure Subsystem sftp uses internal-sftp (required for ChrootDirectory + ForceCommand)
     local _sshd="/etc/ssh/sshd_config"
@@ -4331,7 +4336,10 @@ list_sftp_users() {
         _d=$(grep -A5 "Match User ${_u}" /etc/ssh/sshd_config 2>/dev/null | grep ChrootDirectory | awk '{print $2}')
         # Only show panel-managed SFTP users (chroot under /home/web/ or legacy /var/www/)
         [[ "$_d" == "/home/web/"* || "$_d" == "/var/www/"* ]] || continue
-        printf "  %-20s → %s\n" "$_u" "${_d:-unknown}"
+        local _enc; _enc=$(grep "^${_u}|" "$SFTP_USERS_FILE" 2>/dev/null | cut -d'|' -f2)
+        local _pass; _pass=$(decrypt_pass "$_enc" 2>/dev/null)
+        [[ -z "$_pass" ]] && _pass="(not saved)"
+        printf "  %-20s  %-20s  → %s\n" "$_u" "$_pass" "${_d:-unknown}"
         _found=$((_found+1))
     done < /etc/ssh/sshd_config
     [[ $_found -eq 0 ]] && echo "  No SFTP users configured."
@@ -4377,6 +4385,8 @@ delete_sftp_user() {
     awk "/Match User ${_delu}/{skip=1} skip && /^$/{skip=0; next} !skip" \
         /etc/ssh/sshd_config > "$_tmp" && mv "$_tmp" /etc/ssh/sshd_config
     systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+
+    sed -i "/^${_delu}|/d" "$SFTP_USERS_FILE" 2>/dev/null || true
 
     log_success "SFTP user '${_delu}' removed."
     press_enter
@@ -4544,7 +4554,10 @@ manage_site_users() {
             local _sd; _sd=$(grep -A5 "Match User ${_su}" /etc/ssh/sshd_config 2>/dev/null \
                              | grep ChrootDirectory | awk '{print $2}')
             [[ "$_sd" == "$(get_site_dir "$domain")" || "$_sd" == "/var/www/${domain}" ]] || continue
-            printf "  %-20s → %s\n" "$_su" "$_sd"
+            local _senc; _senc=$(grep "^${_su}|" "$SFTP_USERS_FILE" 2>/dev/null | cut -d'|' -f2)
+            local _spass; _spass=$(decrypt_pass "$_senc" 2>/dev/null)
+            [[ -z "$_spass" ]] && _spass="(not saved)"
+            printf "  %-20s  pass: %-20s\n" "$_su" "$_spass"
             _sftp_found=$((_sftp_found+1))
         done < /etc/ssh/sshd_config
         [[ $_sftp_found -eq 0 ]] && echo "  No SFTP users."
