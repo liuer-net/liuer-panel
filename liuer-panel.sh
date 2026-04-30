@@ -4006,14 +4006,13 @@ create_sftp_user() {
     local _sfuser _sfpass
     case "$_sfmode" in
         1)
-            # Auto: derive username from domain (strip www. and TLD, max 16 chars)
-            local _base; _base=$(echo "$_sfdom" | sed 's/^www\.//' | cut -d. -f1 | tr -cd 'a-z0-9' | cut -c1-16)
-            [[ ${#_base} -lt 3 ]] && _base="sftp${_base}"
-            _sfuser="${_base}"
-            # Avoid collision by appending random suffix
-            if id "$_sfuser" &>/dev/null; then
-                _sfuser="${_base}_$(rand_str 4 | tr '[:upper:]' '[:lower:]')"
-            fi
+            # Auto: fully random username (u + 8 random lowercase alphanum)
+            local _rnd
+            while true; do
+                _rnd=$(cat /dev/urandom | tr -dc 'a-z0-9' | head -c8)
+                _sfuser="u${_rnd}"
+                id "$_sfuser" &>/dev/null || break
+            done
             _sfpass=$(rand_str 16)
             ;;
         2)
@@ -4033,11 +4032,14 @@ create_sftp_user() {
 
     echo "${_sfuser}:${_sfpass}" | chpasswd
 
-    # chroot requires root:root ownership on the jail dir
+    # chroot requires: jail dir owned root:root, NOT writable by group/other, but must be executable (755)
     chown root:root "$_sfsite"
+    chmod 755 "$_sfsite"
     local _web_root; _web_root=$(grep 'WEB_ROOT=' "${SITES_META_DIR}/${_sfdom}.conf" 2>/dev/null \
                                   | cut -d= -f2 || echo "${_sfsite}/public_html")
+    # Give SFTP user ownership of web root so they can read/write files
     chown -R "${_sfuser}:${_sfuser}" "$_web_root" 2>/dev/null || true
+    chmod 755 "$_web_root" 2>/dev/null || true
 
     # Add SFTP block to sshd_config if not already there
     local _sshd="/etc/ssh/sshd_config"
