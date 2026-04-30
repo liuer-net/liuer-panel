@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.38"
+readonly VERSION="2.5.39"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -406,9 +406,8 @@ _repair_sftp_perms() {
                 if [[ -n "$_grp" ]] && getent group "$_grp" &>/dev/null; then
                     # Fix group ownership so all files/dirs belong to web group
                     find "$_croot" -mindepth 1 -exec chown :"$_grp" {} \; 2>/dev/null || true
-                    # Fix primary + supplementary group for sftp_user
-                    usermod -g "$_grp" "$_sfuser" 2>/dev/null || true
-                    usermod -aG "$_grp" "$_sfuser" 2>/dev/null || true
+                    # Fix primary group for sftp_user (suppress "no changes" stdout)
+                    usermod -g "$_grp" "$_sfuser" &>/dev/null || true
                     # Fix PHP-FPM pool umask so PHP-created files are 660 not 644
                     local _pver; _pver=$(grep "^PHP_VERSION=" "${SITES_META_DIR}/${_dom}.conf" \
                         2>/dev/null | cut -d= -f2)
