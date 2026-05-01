@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.41"
+readonly VERSION="2.5.42"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1932,18 +1932,29 @@ show_website_detail() {
 
     local meta="${SITES_META_DIR}/${domain}.conf"
     if [[ -f "$meta" ]]; then
-        local _type _php _root _created
+        local _type _php _root _created _idx
         _type=$(    grep -oP '(?<=TYPE=)[^\n]*'         "$meta" 2>/dev/null || echo "N/A")
         _php=$(     grep -oP '(?<=PHP_VERSION=)[^\n]*'  "$meta" 2>/dev/null || echo "N/A")
         _root=$(    grep -oP '(?<=WEB_ROOT=)[^\n]*'     "$meta" 2>/dev/null || echo "N/A")
         _created=$( grep -oP '(?<=CREATED=)[^\n]*'      "$meta" 2>/dev/null || echo "N/A")
+        _idx=$(     grep -oP '(?<=INDEX_FILE=)[^\n]*'   "$meta" 2>/dev/null)
         echo -e "${BOLD}Type        :${NC} $_type"
         echo -e "${BOLD}PHP version :${NC} $_php"
+        [[ -n "$_idx" ]] && echo -e "${BOLD}Index file  :${NC} $_idx"
         echo -e "${BOLD}Web root    :${NC} $_root"
         echo -e "${BOLD}Created     :${NC} $_created"
         [[ -n "$_php" && "$_php" != "N/A" ]] \
             && echo -e "${BOLD}PHP socket  :${NC} $(get_php_socket "$_php")"
     fi
+
+    # Nginx feature flags
+    local _routing="off" _gzip="off" _scache="off"
+    grep -q 'try_files.*\.php' "$nginx_conf" 2>/dev/null && _routing="on"
+    grep -q '^\s*gzip on' "$nginx_conf" 2>/dev/null && _gzip="on"
+    grep -q 'liuer-static-cache-start' "$nginx_conf" 2>/dev/null && _scache="on"
+    echo -e "${BOLD}URL routing :${NC} $_routing"
+    echo -e "${BOLD}Gzip        :${NC} $_gzip"
+    echo -e "${BOLD}Asset cache :${NC} $_scache"
 
     # SSL info
     local ssl_info="${YELLOW}Not installed${NC}"
@@ -4071,6 +4082,7 @@ view_site_logs() {
     echo "   1  Nginx access log"
     echo "   2  Nginx error log"
     echo "   3  PHP-FPM error log"
+    echo "   0  Cancel"
     echo -ne "  Select [1-3]: "; read -r _ltype
 
     local _lfile=""
@@ -4083,6 +4095,7 @@ view_site_logs() {
                rhel)   _lfile="/var/opt/remi/php${_pver//./}/log/php-fpm/error.log" ;;
                debian) _lfile="/var/log/php${_pver}-fpm.log" ;;
            esac ;;
+        0) return ;;
         *) log_warn "Invalid selection."; press_enter; return ;;
     esac
 
@@ -4095,12 +4108,14 @@ view_site_logs() {
     echo "   1  Last 50 lines"
     echo "   2  Last 100 lines"
     echo "   3  Follow live (Ctrl+C to stop)"
+    echo "   0  Cancel"
     echo -ne "  Select [1-3]: "; read -r _lmode
 
     case "$_lmode" in
         1) tail -n 50  "$_lfile" | less -R ;;
         2) tail -n 100 "$_lfile" | less -R ;;
         3) tail -f "$_lfile" ;;
+        0) return ;;
         *) log_warn "Invalid selection." ;;
     esac
     press_enter
@@ -4466,8 +4481,6 @@ delete_sftp_user() {
     [[ ! "$_sel" =~ ^[0-9]+$ ]] || [[ "$_sel" -lt 1 ]] || [[ "$_sel" -gt ${#_sftp_users[@]} ]] && {
         log_warn "Invalid selection."; press_enter; return; }
     local _delu="${_sftp_users[$((${_sel}-1))]}"
-
-    confirm_danger "Remove SFTP user: ${_delu}" || { log_info "Cancelled."; return; }
 
     confirm_danger "Remove SFTP user: ${_delu}" || { log_info "Cancelled."; return; }
 
