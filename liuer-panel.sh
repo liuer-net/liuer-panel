@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.5.42"
+readonly VERSION="2.6.0"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2052,6 +2052,423 @@ toggle_php_hardening() {
     local svc; svc=$(get_php_service "$_php_ver")
     systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
     press_enter
+}
+
+# ---------------------------------------------------------------------------
+# MAINTENANCE MODE
+# ---------------------------------------------------------------------------
+toggle_maintenance() {
+    print_section "MAINTENANCE MODE"
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
+
+    local _cur="off"
+    [[ -f "${_conf}.premaint" ]] && _cur="on"
+
+    echo -e "\n  Site        : ${BOLD}${domain}${NC}"
+    echo -e "  Maintenance : $([[ "$_cur" == "on" ]] && echo "${RED}ON${NC}" || echo "${GREEN}off${NC}")\n"
+    echo "  1) Enable  — visitors see maintenance page"
+    echo "  2) Disable — restore normal site"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+
+    case "$_ch" in
+        1)
+            [[ "$_cur" == "on" ]] && { log_warn "Already in maintenance mode."; press_enter; return; }
+            cp "$_conf" "${_conf}.premaint"
+
+            local _mdir="${CONFIG_DIR}/maintenance"
+            mkdir -p "$_mdir"
+            [[ ! -f "${_mdir}/index.html" ]] && cat > "${_mdir}/index.html" <<'HTML'
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Under Maintenance</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f8f9fa;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:#fff;padding:48px 40px;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.08);text-align:center;max-width:420px;width:90%}h1{font-size:1.5rem;color:#212529;margin-bottom:12px}p{color:#6c757d;line-height:1.6}</style>
+</head><body><div class="card"><h1>Under Maintenance</h1>
+<p>We're working on something and will be back shortly.</p></div></body></html>
+HTML
+
+            {
+                echo "server {"
+                grep '^\s*listen ' "$_conf" | grep -v 'quic'
+                echo ""
+                grep '^\s*server_name ' "$_conf" | head -1
+                echo ""
+                if grep -q 'ssl_certificate[^_]' "$_conf"; then
+                    grep -E '^\s*(ssl_certificate|ssl_certificate_key|ssl_protocols|ssl_ciphers|ssl_session|ssl_prefer|http2 on)' "$_conf"
+                    echo ""
+                fi
+                echo "    location ^~ /.well-known/acme-challenge/ {"
+                echo "        root /var/lib/letsencrypt/http_challenges;"
+                echo "        default_type text/plain;"
+                echo "        allow all;"
+                echo "    }"
+                echo ""
+                echo "    location / { return 503; }"
+                echo "    error_page 503 @maintenance;"
+                echo "    location @maintenance {"
+                echo "        root ${_mdir};"
+                echo "        rewrite ^ /index.html break;"
+                echo "    }"
+                echo "}"
+            } > "$_conf"
+            log_success "Maintenance mode ON for ${domain}." ;;
+        2)
+            [[ "$_cur" == "off" ]] && { log_warn "Site is not in maintenance mode."; press_enter; return; }
+            mv "${_conf}.premaint" "$_conf"
+            log_success "Maintenance mode OFF for ${domain}." ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    nginx -t &>/dev/null && nginx -s reload || { log_error "Nginx config error."; press_enter; return; }
+    press_enter
+}
+
+# ---------------------------------------------------------------------------
+# BASIC AUTH
+# ---------------------------------------------------------------------------
+manage_basic_auth() {
+    print_section "BASIC AUTH"
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
+
+    local _htdir="${CONFIG_DIR}/htpasswd"
+    local _htfile="${_htdir}/${domain}"
+    local _cur="disabled"
+    grep -q '# liuer-basicauth-start' "$_conf" && _cur="enabled"
+
+    echo -e "\n  Site       : ${BOLD}${domain}${NC}"
+    echo -e "  Basic auth : ${GREEN}${_cur}${NC}\n"
+    echo "  1) Enable / add user"
+    echo "  2) Remove user"
+    echo "  3) Disable (remove all)"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+
+    case "$_ch" in
+        1)
+            echo -ne "  Username: "; read -r _buser
+            [[ -z "$_buser" ]] && { log_warn "Username required."; press_enter; return; }
+            echo -ne "  Password: "; read -r _bpass
+            [[ -z "$_bpass" ]] && { log_warn "Password required."; press_enter; return; }
+            mkdir -p "$_htdir"
+            local _hashed; _hashed=$(openssl passwd -apr1 "$_bpass")
+            # Remove existing entry for user, then append
+            sed -i "/^${_buser}:/d" "$_htfile" 2>/dev/null || true
+            echo "${_buser}:${_hashed}" >> "$_htfile"
+            chmod 640 "$_htfile"
+
+            if [[ "$_cur" == "disabled" ]]; then
+                local _tmpf; _tmpf=$(mktemp)
+                awk -v htf="$_htfile" '/location ~ \/\\./{
+                    if (!ins) {
+                        print "    # liuer-basicauth-start"
+                        print "    auth_basic \"Restricted\";"
+                        print "    auth_basic_user_file " htf ";"
+                        print "    # liuer-basicauth-end"
+                        print ""
+                        ins=1
+                    }
+                } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            fi
+            log_success "User '${_buser}' added to basic auth for ${domain}." ;;
+        2)
+            [[ ! -f "$_htfile" ]] && { log_warn "No htpasswd file found."; press_enter; return; }
+            echo "  Users:"
+            nl -ba "$_htfile" | awk -F: '{print "  " $1 ") " $2}'
+            echo -ne "  Username to remove: "; read -r _buser
+            sed -i "/^${_buser}:/d" "$_htfile" 2>/dev/null || true
+            log_success "User '${_buser}' removed." ;;
+        3)
+            local _tmpf; _tmpf=$(mktemp)
+            awk '/# liuer-basicauth-start/{skip=1} skip && /# liuer-basicauth-end/{skip=0; next} !skip' \
+                "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            rm -f "$_htfile"
+            log_success "Basic auth disabled for ${domain}." ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
+    press_enter
+}
+
+# ---------------------------------------------------------------------------
+# REDIRECT / WWW HANDLING
+# ---------------------------------------------------------------------------
+manage_redirects() {
+    print_section "REDIRECTS"
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
+
+    local _www_cur="none"
+    grep -q "server_name www\\.${domain}" "$_conf" && {
+        grep -q 'return 301.*non-www\|return 301.*://${domain}' "$_conf" \
+            && _www_cur="www→bare" || _www_cur="both"
+    }
+    grep -q "liuer-redirect-www2bare" "$_conf" && _www_cur="www→bare"
+    grep -q "liuer-redirect-bare2www" "$_conf" && _www_cur="bare→www"
+
+    echo -e "\n  Site     : ${BOLD}${domain}${NC}"
+    echo -e "  WWW mode : ${GREEN}${_www_cur}${NC}\n"
+    echo "  1) www → bare  (redirect www.domain → domain)"
+    echo "  2) bare → www  (redirect domain → www.domain)"
+    echo "  3) Remove redirect"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+
+    local _redir_conf="${NGINX_CONF_DIR}/${domain}-redirect.conf"
+
+    case "$_ch" in
+        1)
+            local _has_ssl=0; grep -q 'ssl_certificate' "$_conf" && _has_ssl=1
+            local _listen80="listen 80; listen [::]:80;"
+            local _listen443=""
+            [[ $_has_ssl -eq 1 ]] && _listen443="listen 443 ssl; http2 on;"
+            cat > "$_redir_conf" <<EOF
+# liuer-redirect-www2bare
+server {
+    ${_listen80}
+    ${_listen443}
+    server_name www.${domain};
+$(grep -E '^\s*(ssl_certificate|ssl_certificate_key)' "$_conf" 2>/dev/null || true)
+    return 301 \$scheme://${domain}\$request_uri;
+}
+EOF
+            log_success "Redirect www.${domain} → ${domain} set." ;;
+        2)
+            local _has_ssl=0; grep -q 'ssl_certificate' "$_conf" && _has_ssl=1
+            local _listen80="listen 80; listen [::]:80;"
+            local _listen443=""
+            [[ $_has_ssl -eq 1 ]] && _listen443="listen 443 ssl; http2 on;"
+            cat > "$_redir_conf" <<EOF
+# liuer-redirect-bare2www
+server {
+    ${_listen80}
+    ${_listen443}
+    server_name ${domain};
+$(grep -E '^\s*(ssl_certificate|ssl_certificate_key)' "$_conf" 2>/dev/null || true)
+    return 301 \$scheme://www.${domain}\$request_uri;
+}
+EOF
+            log_success "Redirect ${domain} → www.${domain} set." ;;
+        3)
+            rm -f "$_redir_conf"
+            log_success "Redirect removed for ${domain}." ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
+    press_enter
+}
+
+# ---------------------------------------------------------------------------
+# DOMAIN ALIAS
+# ---------------------------------------------------------------------------
+manage_domain_aliases() {
+    print_section "DOMAIN ALIAS"
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
+
+    local _sname_line; _sname_line=$(grep '^\s*server_name ' "$_conf" | head -1)
+    echo -e "\n  Site           : ${BOLD}${domain}${NC}"
+    echo -e "  Current names  : ${_sname_line#*server_name }\n"
+    echo "  1) Add domain/alias"
+    echo "  2) Remove domain/alias"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
+
+    case "$_ch" in
+        1)
+            echo -ne "  New domain/alias (e.g. alias.com): "; read -r _alias
+            [[ -z "$_alias" ]] && { log_warn "No domain entered."; press_enter; return; }
+            # Check not already in server_name
+            grep -q "$_alias" "$_conf" && { log_warn "'${_alias}' already in config."; press_enter; return; }
+            # Insert alias before the closing ; of server_name
+            sed -i "s|^\(\s*server_name.*\);|\1 ${_alias};|" "$_conf"
+            log_success "Alias '${_alias}' added to ${domain}." ;;
+        2)
+            echo -e "  Current: ${_sname_line#*server_name }"
+            echo -ne "  Domain/alias to remove: "; read -r _alias
+            [[ -z "$_alias" ]] && { log_warn "No domain entered."; press_enter; return; }
+            [[ "$_alias" == "$domain" || "$_alias" == "www.${domain}" ]] && {
+                log_warn "Cannot remove primary domain or www."; press_enter; return; }
+            sed -i "s| ${_alias}||g; s|${_alias} ||g" "$_conf"
+            log_success "Alias '${_alias}' removed from ${domain}." ;;
+        0) return ;;
+        *) log_warn "Invalid selection."; press_enter; return ;;
+    esac
+
+    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
+    press_enter
+}
+
+# ---------------------------------------------------------------------------
+# CRON JOB MANAGER
+# ---------------------------------------------------------------------------
+manage_cron_jobs() {
+    print_section "CRON JOBS"
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _site_user; _site_user=$(grep "^WEB_USER=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _cron_user="${_site_user:-root}"
+
+    while true; do
+        print_section "CRON JOBS — ${domain} (user: ${_cron_user})"
+        echo ""
+        local _crons; _crons=$(crontab -l -u "$_cron_user" 2>/dev/null | grep -v '^#' | grep -v '^$')
+        if [[ -n "$_crons" ]]; then
+            local _i=1
+            while IFS= read -r _line; do
+                printf "  %2d) %s\n" "$_i" "$_line"
+                ((_i++)) || true
+            done <<< "$_crons"
+        else
+            echo "  (no cron jobs)"
+        fi
+        echo ""
+        separator
+        echo "   1  Add cron job"
+        echo "   2  Delete cron job"
+        echo "   3  Edit all (opens crontab)"
+        echo "   0  Back"
+        echo -ne "${YELLOW}  Select: ${NC}"; read -r _ch
+
+        case "$_ch" in
+            1)
+                echo -e "\n  ${DIM}Format: * * * * * command${NC}"
+                echo -e "  ${DIM}Example: 0 2 * * * cd /home/web/${domain} && php artisan schedule:run${NC}\n"
+                echo -ne "  Cron expression: "; read -r _cexpr
+                echo -ne "  Command        : "; read -r _ccmd
+                [[ -z "$_cexpr" || -z "$_ccmd" ]] && { log_warn "Expression and command required."; press_enter; continue; }
+                (crontab -l -u "$_cron_user" 2>/dev/null; echo "${_cexpr} ${_ccmd}") \
+                    | crontab -u "$_cron_user" -
+                log_success "Cron job added." ;;
+            2)
+                [[ -z "$_crons" ]] && { log_warn "No cron jobs to delete."; press_enter; continue; }
+                echo -ne "  Delete line number: "; read -r _del
+                [[ ! "$_del" =~ ^[0-9]+$ ]] && { log_warn "Invalid number."; press_enter; continue; }
+                crontab -l -u "$_cron_user" 2>/dev/null \
+                    | awk -v skip=0 -v target="$_del" '
+                        /^#/ || /^$/ { print; next }
+                        { ++n; if (n == target) next; print }
+                    ' | crontab -u "$_cron_user" -
+                log_success "Cron job #${_del} removed." ;;
+            3)
+                EDITOR="${EDITOR:-vi}" crontab -e -u "$_cron_user" ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# FRAMEWORK TOOLS
+# ---------------------------------------------------------------------------
+menu_framework_tools() {
+    SELECTED_DOMAIN=""
+    _select_domain "Select site" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _type; _type=$(grep "^TYPE=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _site_user; _site_user=$(grep "^WEB_USER=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _web_root; _web_root=$(grep "^WEB_ROOT=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _php_ver; _php_ver=$(grep "^PHP_VERSION=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _php_bin="php${_php_ver}"
+    command -v "$_php_bin" &>/dev/null || _php_bin="php"
+
+    case "$_type" in
+        laravel)
+            while true; do
+                _sub_header "LARAVEL TOOLS — ${domain}"
+                echo "   1  php artisan (custom command)"
+                echo "   2  cache:clear"
+                echo "   3  config:cache"
+                echo "   4  migrate"
+                echo "   5  migrate:fresh --seed"
+                echo "   6  queue:restart"
+                echo "   7  optimize"
+                echo "   8  storage:link"
+                _sub_footer; read -r _ch
+                local _art="${_web_root}/artisan"
+                [[ ! -f "$_art" ]] && { log_error "artisan not found in ${_web_root}"; press_enter; return; }
+                local _run="sudo -u ${_site_user} ${_php_bin} ${_art}"
+                case "$_ch" in
+                    1) echo -ne "  artisan command: "; read -r _cmd
+                       [[ -n "$_cmd" ]] && { echo ""; $_run $_cmd; } ;;
+                    2) $_run cache:clear ;;
+                    3) $_run config:cache ;;
+                    4) $_run migrate ;;
+                    5) $_run migrate:fresh --seed ;;
+                    6) $_run queue:restart ;;
+                    7) $_run optimize ;;
+                    8) $_run storage:link ;;
+                    0) return ;;
+                    *) log_warn "Invalid selection." ;;
+                esac
+                press_enter
+            done ;;
+        wordpress)
+            # Install WP-CLI if not present
+            if ! command -v wp &>/dev/null; then
+                log_info "Installing WP-CLI..."
+                curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
+                    -o /usr/local/bin/wp 2>/dev/null \
+                    && chmod +x /usr/local/bin/wp \
+                    || { log_error "Failed to install WP-CLI."; press_enter; return; }
+                log_success "WP-CLI installed."
+            fi
+            local _wp="sudo -u ${_site_user} wp --path=${_web_root} --allow-root"
+            while true; do
+                _sub_header "WORDPRESS TOOLS — ${domain}"
+                echo "   1  wp (custom command)"
+                echo "   2  cache flush"
+                echo "   3  plugin update --all"
+                echo "   4  theme update --all"
+                echo "   5  core update"
+                echo "   6  cron event run --due-now"
+                echo "   7  user list"
+                echo "   8  reset admin password"
+                _sub_footer; read -r _ch
+                case "$_ch" in
+                    1) echo -ne "  wp command: "; read -r _cmd
+                       [[ -n "$_cmd" ]] && { echo ""; $_wp $_cmd; } ;;
+                    2) $_wp cache flush ;;
+                    3) $_wp plugin update --all ;;
+                    4) $_wp theme update --all ;;
+                    5) $_wp core update ;;
+                    6) $_wp cron event run --due-now ;;
+                    7) $_wp user list ;;
+                    8)
+                        echo -ne "  Admin username: "; read -r _wadmin
+                        echo -ne "  New password  : "; read -r _wpass
+                        [[ -n "$_wadmin" && -n "$_wpass" ]] && \
+                            $_wp user update "$_wadmin" --user_pass="$_wpass" ;;
+                    0) return ;;
+                    *) log_warn "Invalid selection." ;;
+                esac
+                press_enter
+            done ;;
+        *)
+            log_warn "Framework tools only available for Laravel and WordPress sites (this is: ${_type:-unknown})."
+            press_enter ;;
+    esac
 }
 
 toggle_static_cache() {
@@ -4604,6 +5021,12 @@ menu_website() {
         echo "  13  PHP URL routing"
         echo "  14  Gzip compression"
         echo "  15  Static asset caching"
+        echo "  16  Maintenance mode"
+        echo "  17  Basic auth"
+        echo "  18  Redirects (www handling)"
+        echo "  19  Domain aliases"
+        echo "  20  Cron jobs"
+        echo "  21  Framework tools (Laravel / WordPress)"
         _sub_footer; read -r _ch
         case "$_ch" in
             1)  create_website ;;
@@ -4621,6 +5044,12 @@ menu_website() {
             13) toggle_php_routing ;;
             14) toggle_gzip ;;
             15) toggle_static_cache ;;
+            16) toggle_maintenance ;;
+            17) manage_basic_auth ;;
+            18) manage_redirects ;;
+            19) manage_domain_aliases ;;
+            20) manage_cron_jobs ;;
+            21) menu_framework_tools ;;
             0)  return ;;
             *)  log_warn "Invalid selection." ;;
         esac
