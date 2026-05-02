@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.2"
+readonly VERSION="2.6.3"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -5697,6 +5697,425 @@ _api_get_disk_usage() {
     [[ -d "$site_dir" ]] && du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0"
 }
 
+_api_get_advanced_settings() {
+    # Returns JSON with current state of gzip, static_cache, hardening, http_protocol, redirect, basic_auth
+    local domain="$1"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _htfile="${CONFIG_DIR}/htpasswd/${domain}"
+    local _redir_conf="${NGINX_CONF_DIR}/${domain}-redirect.conf"
+
+    local _gzip="false"
+    grep -q '^\s*gzip on' "$_conf" 2>/dev/null && _gzip="true"
+
+    local _static_cache="false"
+    grep -q '# liuer-static-cache-start' "$_conf" 2>/dev/null && _static_cache="true"
+
+    local _hardening="false"
+    local _df_state; _df_state=$(grep "^DISABLE_FUNCTIONS=" "$_meta" 2>/dev/null | cut -d= -f2)
+    [[ "$_df_state" == "1" ]] && _hardening="true"
+
+    local _proto="h1"
+    grep -q 'http3 on\|listen 443 quic' "$_conf" 2>/dev/null && _proto="h3" \
+        || { grep -q 'http2 on\|ssl http2' "$_conf" 2>/dev/null && _proto="h2"; }
+
+    local _redirect="none"
+    [[ -f "$_redir_conf" ]] && {
+        grep -q 'liuer-redirect-www2bare' "$_redir_conf" && _redirect="www2bare"
+        grep -q 'liuer-redirect-bare2www' "$_redir_conf" && _redirect="bare2www"
+    }
+
+    local _basic_auth="false"
+    grep -q '# liuer-basicauth-start' "$_conf" 2>/dev/null && _basic_auth="true"
+
+    local _ba_users="[]"
+    if [[ -f "$_htfile" ]]; then
+        local _ulist=""
+        while IFS=: read -r _u _; do
+            [[ -z "$_u" ]] && continue
+            _ulist="${_ulist:+${_ulist},}\"${_u}\""
+        done < "$_htfile"
+        _ba_users="[${_ulist}]"
+    fi
+
+    printf '{"gzip":%s,"static_cache":%s,"hardening":%s,"http_protocol":"%s","redirect":"%s","basic_auth":%s,"basic_auth_users":%s}' \
+        "$_gzip" "$_static_cache" "$_hardening" "$_proto" "$_redirect" "$_basic_auth" "$_ba_users"
+}
+
+_api_set_http_protocol() {
+    local domain="$1" proto="${2:-h1}"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Site not found: $domain"; exit 1; }
+    case "$proto" in
+        h1)
+            _nginx_remove_h2_h3 "$_conf" ;;
+        h2)
+            _nginx_remove_h2_h3 "$_conf"
+            sed -i '/listen 443 ssl/a\    http2 on;' "$_conf" ;;
+        h3)
+            grep -q "ssl_certificate" "$_conf" || { log_error "SSL required for HTTP/3"; exit 1; }
+            local _backup; _backup=$(mktemp)
+            cp "$_conf" "$_backup"
+            _nginx_remove_h2_h3 "$_conf"
+            local _quic_listen="    listen 443 quic reuseport;"
+            grep -r "listen.*quic.*reuseport" /etc/nginx/ 2>/dev/null | grep -qv "^${_conf}:" \
+                && _quic_listen="    listen 443 quic;"
+            local _tmpf; _tmpf=$(mktemp)
+            while IFS= read -r _l; do
+                echo "$_l"
+                if echo "$_l" | grep -q 'listen 443 ssl'; then
+                    echo "    http2 on;"
+                    echo "    http3 on;"
+                    echo "$_quic_listen"
+                    echo "    add_header Alt-Svc 'h3=\":443\"; ma=86400';"
+                fi
+            done < "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            if ! nginx -t &>/dev/null; then
+                cp "$_backup" "$_conf"; rm -f "$_backup"
+                log_error "Nginx config invalid — rolled back"; exit 1
+            fi
+            rm -f "$_backup" ;;
+        *) log_error "Invalid protocol: $proto"; exit 1 ;;
+    esac
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_set_hardening() {
+    local domain="$1" enabled="${2:-1}"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _php_ver; _php_ver=$(grep "^PHP_VERSION=" "$_meta" 2>/dev/null | cut -d= -f2)
+    [[ -z "$_php_ver" ]] && { log_error "No PHP version for $domain"; exit 1; }
+    local _pool_conf; _pool_conf=$(get_php_pool_conf "$_php_ver" "$domain")
+    sed -i "/^php_admin_value\[disable_functions\]/d" "$_pool_conf" 2>/dev/null || true
+    if [[ "$enabled" == "1" ]]; then
+        echo "php_admin_value[disable_functions] = ${DANGEROUS_FUNCTIONS}" >> "$_pool_conf"
+        sed -i "s/^DISABLE_FUNCTIONS=.*/DISABLE_FUNCTIONS=1/" "$_meta"
+        grep -q "^DISABLE_FUNCTIONS=" "$_meta" || echo "DISABLE_FUNCTIONS=1" >> "$_meta"
+    else
+        sed -i "s/^DISABLE_FUNCTIONS=.*/DISABLE_FUNCTIONS=0/" "$_meta"
+        grep -q "^DISABLE_FUNCTIONS=" "$_meta" || echo "DISABLE_FUNCTIONS=0" >> "$_meta"
+    fi
+    local svc; svc=$(get_php_service "$_php_ver")
+    systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+}
+
+_api_set_gzip() {
+    local domain="$1" enabled="${2:-1}"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Site not found"; exit 1; }
+    if [[ "$enabled" == "1" ]]; then
+        grep -q '^\s*gzip on' "$_conf" && { exit 0; }
+        local _tmpf; _tmpf=$(mktemp)
+        awk '/location ~ \/\\./{
+            if (!ins) {
+                print "    gzip on;"
+                print "    gzip_vary on;"
+                print "    gzip_proxied any;"
+                print "    gzip_comp_level 6;"
+                print "    gzip_types text/plain text/css text/xml application/json application/javascript application/xml+rss application/atom+xml image/svg+xml;"
+                print ""
+                ins=1
+            }
+        } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+    else
+        sed -i '/^\s*gzip/d' "$_conf"
+    fi
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_set_static_cache() {
+    local domain="$1" enabled="${2:-1}"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Site not found"; exit 1; }
+    if [[ "$enabled" == "1" ]]; then
+        grep -q '# liuer-static-cache-start' "$_conf" && { exit 0; }
+        local _tmpf; _tmpf=$(mktemp)
+        awk '/location ~ \/\\./{
+            if (!ins) {
+                print "    # liuer-static-cache-start"
+                print "    location ~* \\.(png|jpg|webp|gif|jpeg|zip|css|svg|js|pdf|woff2|ttf|eot|otf|ico|mp4|webm)$ {"
+                print "        add_header Cache-Control \"public, max-age=31536000, immutable\";"
+                print "        access_log off;"
+                print "    }"
+                print "    # liuer-static-cache-end"
+                print ""
+                ins=1
+            }
+        } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+    else
+        local _tmpf; _tmpf=$(mktemp)
+        awk '/# liuer-static-cache-start/{skip=1} skip && /# liuer-static-cache-end/{skip=0; next} !skip' \
+            "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+    fi
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_set_basic_auth() {
+    local domain="$1" action="$2" username="${3:-}" password="${4:-}"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local _htdir="${CONFIG_DIR}/htpasswd"
+    local _htfile="${_htdir}/${domain}"
+    case "$action" in
+        enable)
+            [[ -z "$username" || -z "$password" ]] && { log_error "Username and password required"; exit 1; }
+            mkdir -p "$_htdir"
+            local _hashed; _hashed=$(openssl passwd -apr1 "$password")
+            sed -i "/^${username}:/d" "$_htfile" 2>/dev/null || true
+            echo "${username}:${_hashed}" >> "$_htfile"
+            chmod 640 "$_htfile"
+            if ! grep -q '# liuer-basicauth-start' "$_conf"; then
+                local _tmpf; _tmpf=$(mktemp)
+                awk -v htf="$_htfile" '/location ~ \/\\./{
+                    if (!ins) {
+                        print "    # liuer-basicauth-start"
+                        print "    auth_basic \"Restricted\";"
+                        print "    auth_basic_user_file " htf ";"
+                        print "    # liuer-basicauth-end"
+                        print ""
+                        ins=1
+                    }
+                } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            fi ;;
+        remove_user)
+            [[ -z "$username" ]] && { log_error "Username required"; exit 1; }
+            [[ -f "$_htfile" ]] && sed -i "/^${username}:/d" "$_htfile" || true ;;
+        disable)
+            local _tmpf; _tmpf=$(mktemp)
+            awk '/# liuer-basicauth-start/{skip=1} skip && /# liuer-basicauth-end/{skip=0; next} !skip' \
+                "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
+            rm -f "$_htfile" ;;
+        *) log_error "Invalid action: $action"; exit 1 ;;
+    esac
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_set_redirect() {
+    local domain="$1" mode="${2:-none}"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local _redir_conf="${NGINX_CONF_DIR}/${domain}-redirect.conf"
+    local _has_ssl=0
+    grep -q 'ssl_certificate' "$_conf" 2>/dev/null && _has_ssl=1
+    local _listen80="listen 80; listen [::]:80;"
+    local _listen443=""
+    [[ $_has_ssl -eq 1 ]] && _listen443="listen 443 ssl; http2 on;"
+    case "$mode" in
+        none)
+            rm -f "$_redir_conf" ;;
+        www2bare)
+            cat > "$_redir_conf" <<EOF
+# liuer-redirect-www2bare
+server {
+    ${_listen80}
+    ${_listen443}
+    server_name www.${domain};
+$(grep -E '^\s*(ssl_certificate|ssl_certificate_key)' "$_conf" 2>/dev/null || true)
+    return 301 \$scheme://${domain}\$request_uri;
+}
+EOF
+            ;;
+        bare2www)
+            cat > "$_redir_conf" <<EOF
+# liuer-redirect-bare2www
+server {
+    ${_listen80}
+    ${_listen443}
+    server_name ${domain};
+$(grep -E '^\s*(ssl_certificate|ssl_certificate_key)' "$_conf" 2>/dev/null || true)
+    return 301 \$scheme://www.${domain}\$request_uri;
+}
+EOF
+            ;;
+        *) log_error "Invalid mode: $mode"; exit 1 ;;
+    esac
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_list_aliases() {
+    local domain="$1"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { printf '{"aliases":[]}'; return; }
+    local _sname_line; _sname_line=$(grep '^\s*server_name ' "$_conf" | head -1)
+    local _names; _names=$(echo "$_sname_line" | sed 's/\s*server_name\s*//; s/;//' | tr ' ' '\n' | grep -v "^${domain}$\|^www\.${domain}$\|^$")
+    printf '{"aliases":['
+    local _first=1
+    while IFS= read -r _n; do
+        [[ -z "$_n" ]] && continue
+        [[ "$_first" -eq 0 ]] && printf ','
+        printf '"%s"' "$_n"
+        _first=0
+    done <<< "$_names"
+    printf ']}'
+}
+
+_api_add_alias() {
+    local domain="$1" alias="$2"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Site not found"; exit 1; }
+    grep -q "$alias" "$_conf" && { exit 0; }
+    sed -i "s|^\(\s*server_name.*\);|\1 ${alias};|" "$_conf"
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_del_alias() {
+    local domain="$1" alias="$2"
+    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$_conf" ]] && { log_error "Site not found"; exit 1; }
+    sed -i "s| ${alias}||g; s|${alias} ||g" "$_conf"
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_get_upload_settings() {
+    local domain="$1"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _php_ver; _php_ver=$(grep "^PHP_VERSION=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local _pool_conf=""
+    [[ -n "$_php_ver" ]] && _pool_conf=$(get_php_pool_conf "$_php_ver" "$domain")
+    local _body _ftimeout _upload _post _mem _exec _input
+    _body=$(grep -oP '(?<=client_max_body_size )[^;]+' "$nginx_conf" 2>/dev/null | head -1)
+    _ftimeout=$(grep -oP '(?<=fastcgi_read_timeout )[^;]+' "$nginx_conf" 2>/dev/null | head -1)
+    if [[ -n "$_pool_conf" && -f "$_pool_conf" ]]; then
+        _upload=$(grep "^php_admin_value\[upload_max_filesize\]" "$_pool_conf" | sed 's/.*= //')
+        _post=$(grep "^php_admin_value\[post_max_size\]" "$_pool_conf" | sed 's/.*= //')
+        _mem=$(grep "^php_value\[memory_limit\]" "$_pool_conf" | sed 's/.*= //')
+        _exec=$(grep "^php_admin_value\[max_execution_time\]" "$_pool_conf" | sed 's/.*= //')
+        _input=$(grep "^php_admin_value\[max_input_time\]" "$_pool_conf" | sed 's/.*= //')
+    fi
+    printf '{"body_size":"%s","fastcgi_timeout":"%s","upload_max_filesize":"%s","post_max_size":"%s","memory_limit":"%s","max_execution_time":"%s","max_input_time":"%s"}' \
+        "${_body:-64M}" "${_ftimeout:-300}" "${_upload:-64M}" "${_post:-64M}" "${_mem:-128M}" "${_exec:-300}" "${_input:-300}"
+}
+
+_api_set_upload_settings() {
+    local domain="$1" body_size="${2:-64M}" fastcgi_timeout="${3:-300}"
+    local upload="${4:-64M}" post="${5:-64M}" mem="${6:-128M}" exec_time="${7:-300}" input="${8:-300}"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _php_ver; _php_ver=$(grep "^PHP_VERSION=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local _pool_conf=""
+    [[ -n "$_php_ver" ]] && _pool_conf=$(get_php_pool_conf "$_php_ver" "$domain")
+    if grep -q "client_max_body_size" "$nginx_conf" 2>/dev/null; then
+        sed -i "s|client_max_body_size [^;]*;|client_max_body_size ${body_size};|g" "$nginx_conf"
+    else
+        sed -i "/server_name /a\\    client_max_body_size ${body_size};" "$nginx_conf"
+    fi
+    if grep -q "fastcgi_read_timeout" "$nginx_conf" 2>/dev/null; then
+        sed -i "s|fastcgi_read_timeout [^;]*;|fastcgi_read_timeout ${fastcgi_timeout};|g" "$nginx_conf"
+    else
+        sed -i "/fastcgi_pass unix:/a\\        fastcgi_read_timeout ${fastcgi_timeout};" "$nginx_conf"
+    fi
+    if [[ -n "$_pool_conf" && -f "$_pool_conf" ]]; then
+        _php_pool_set "$_pool_conf" "php_admin_value[upload_max_filesize]" "$upload"
+        _php_pool_set "$_pool_conf" "php_admin_value[post_max_size]"       "$post"
+        _php_pool_set "$_pool_conf" "php_value[memory_limit]"              "$mem"
+        _php_pool_set "$_pool_conf" "php_admin_value[max_execution_time]"  "$exec_time"
+        _php_pool_set "$_pool_conf" "php_admin_value[max_input_time]"      "$input"
+        local svc; svc=$(get_php_service "$_php_ver")
+        systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+    fi
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_list_crons() {
+    local domain="$1"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _site_user; _site_user=$(grep "^WEB_USER=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _cron_user="${_site_user:-root}"
+    printf '{"crons":['
+    local _first=1
+    while IFS= read -r _l; do
+        [[ "$_l" =~ ^# || -z "$_l" ]] && continue
+        local _esc; _esc=$(printf '%s' "$_l" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        [[ "$_first" -eq 0 ]] && printf ','
+        printf '"%s"' "$_esc"
+        _first=0
+    done < <(crontab -l -u "$_cron_user" 2>/dev/null || true)
+    printf '],"user":"%s"}' "$_cron_user"
+}
+
+_api_add_cron() {
+    local domain="$1" expression="$2" command="$3"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _site_user; _site_user=$(grep "^WEB_USER=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _cron_user="${_site_user:-root}"
+    (crontab -l -u "$_cron_user" 2>/dev/null; echo "${expression} ${command}") \
+        | crontab -u "$_cron_user" -
+}
+
+_api_del_cron() {
+    local domain="$1" index="$2"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _site_user; _site_user=$(grep "^WEB_USER=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _cron_user="${_site_user:-root}"
+    crontab -l -u "$_cron_user" 2>/dev/null \
+        | awk -v target="$index" '
+            /^#/ || /^$/ { print; next }
+            { ++n; if (n == target) next; print }
+        ' | crontab -u "$_cron_user" -
+}
+
+_api_get_logs() {
+    local domain="$1" type="${2:-access}" lines="${3:-100}"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _lfile=""
+    case "$type" in
+        access) _lfile="/var/log/nginx/${domain}-access.log" ;;
+        error)  _lfile="/var/log/nginx/${domain}-error.log" ;;
+        php)
+            local _pver; _pver=$(grep 'PHP_VERSION=' "$_meta" 2>/dev/null | cut -d= -f2)
+            case "$OS_FAMILY" in
+                rhel)   _lfile="/var/opt/remi/php${_pver//./}/log/php-fpm/error.log" ;;
+                debian) _lfile="/var/log/php${_pver}-fpm.log" ;;
+            esac ;;
+    esac
+    [[ ! -f "$_lfile" ]] && { printf 'NOT_FOUND:%s' "${_lfile:-unknown}"; return 0; }
+    tail -n "$lines" "$_lfile" 2>/dev/null
+}
+
+_api_run_framework() {
+    local domain="$1" action="$2" extra_arg="${3:-}"
+    local _meta="${SITES_META_DIR}/${domain}.conf"
+    local _type; _type=$(grep "^TYPE=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _site_user; _site_user=$(grep "^WEB_USER=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _web_root; _web_root=$(grep "^WEB_ROOT=" "$_meta" 2>/dev/null | cut -d= -f2)
+    [[ -z "$_web_root" ]] && _web_root="/home/web/${_site_user}/${domain}/public_html"
+    local _php_ver; _php_ver=$(grep "^PHP_VERSION=" "$_meta" 2>/dev/null | cut -d= -f2)
+    local _php_bin="php${_php_ver}"
+    command -v "$_php_bin" &>/dev/null || _php_bin="php"
+    case "$_type" in
+        laravel)
+            local _art; _art="${_web_root}/../artisan"
+            [[ ! -f "$_art" ]] && _art="${_web_root}/artisan"
+            [[ ! -f "$_art" ]] && { log_error "artisan not found"; exit 1; }
+            local _run="sudo -u ${_site_user} ${_php_bin} ${_art}"
+            case "$action" in
+                artisan)       $_run $extra_arg ;;
+                cache_clear)   $_run cache:clear ;;
+                config_cache)  $_run config:cache ;;
+                migrate)       $_run migrate --force ;;
+                optimize)      $_run optimize ;;
+                queue_restart) $_run queue:restart ;;
+                storage_link)  $_run storage:link ;;
+                *) log_error "Unknown action: $action"; exit 1 ;;
+            esac ;;
+        wordpress)
+            if ! command -v wp &>/dev/null; then
+                curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
+                    -o /usr/local/bin/wp 2>/dev/null && chmod +x /usr/local/bin/wp \
+                    || { log_error "Failed to install WP-CLI"; exit 1; }
+            fi
+            local _wp="sudo -u ${_site_user} wp --path=${_web_root} --allow-root"
+            case "$action" in
+                wp)            $_wp $extra_arg ;;
+                cache_flush)   $_wp cache flush ;;
+                plugin_update) $_wp plugin update --all ;;
+                theme_update)  $_wp theme update --all ;;
+                core_update)   $_wp core update ;;
+                *) log_error "Unknown action: $action"; exit 1 ;;
+            esac ;;
+        *) log_error "Framework tools not available for type: ${_type:-unknown}"; exit 1 ;;
+    esac
+}
+
 _api_set_maintenance() {
     local domain="$1" action="${2:-enable}"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
@@ -5994,6 +6413,24 @@ main() {
         unlock_site)       check_root; detect_os; _api_unlock_site    "${2:-}" ;;
         restart_php)       check_root; detect_os; _api_restart_php    "${2:-}" ;;
         request_ssl)       check_root; detect_os; _api_request_ssl   "${2:-}" "${3:-}" ;;
+
+        get_advanced_settings) detect_os; _api_get_advanced_settings "${2:-}" ;;
+        set_http_protocol)     check_root; detect_os; _api_set_http_protocol    "${2:-}" "${3:-h1}" ;;
+        set_hardening)         check_root; detect_os; _api_set_hardening        "${2:-}" "${3:-1}" ;;
+        set_gzip)              check_root; detect_os; _api_set_gzip             "${2:-}" "${3:-1}" ;;
+        set_static_cache)      check_root; detect_os; _api_set_static_cache     "${2:-}" "${3:-1}" ;;
+        set_basic_auth)        check_root; detect_os; _api_set_basic_auth       "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        set_redirect)          check_root; detect_os; _api_set_redirect         "${2:-}" "${3:-none}" ;;
+        list_aliases)          detect_os;             _api_list_aliases          "${2:-}" ;;
+        add_alias)             check_root; detect_os; _api_add_alias            "${2:-}" "${3:-}" ;;
+        del_alias)             check_root; detect_os; _api_del_alias            "${2:-}" "${3:-}" ;;
+        get_upload_settings)   detect_os;             _api_get_upload_settings   "${2:-}" ;;
+        set_upload_settings)   check_root; detect_os; _api_set_upload_settings  "${2:-}" "${3:-64M}" "${4:-300}" "${5:-64M}" "${6:-64M}" "${7:-128M}" "${8:-300}" "${9:-300}" ;;
+        list_crons)            detect_os;             _api_list_crons            "${2:-}" ;;
+        add_cron)              check_root; detect_os; _api_add_cron             "${2:-}" "${3:-}" "${4:-}" ;;
+        del_cron)              check_root; detect_os; _api_del_cron             "${2:-}" "${3:-}" ;;
+        get_logs)              detect_os;             _api_get_logs              "${2:-}" "${3:-access}" "${4:-100}" ;;
+        run_framework)         check_root; detect_os; _api_run_framework         "${2:-}" "${3:-}" "${4:-}" ;;
 
         # ── Unknown command ───────────────────────────────────────────────────
         *)
