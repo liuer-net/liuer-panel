@@ -332,6 +332,12 @@ pm.max_children = 5
 pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 3
+EOF
+    # umask is supported on Debian/Ubuntu PHP-FPM but not REMI builds
+    if [[ "${OS_FAMILY:-}" == "debian" ]]; then
+        echo "umask = 0007" >> "$pool_conf"
+    fi
+    cat >> "$pool_conf" <<EOF
 php_admin_value[error_log] = /var/log/nginx/${domain}_php_error.log
 php_admin_flag[log_errors] = on
 php_admin_value[open_basedir] = ${site_path}:/tmp:/var/tmp
