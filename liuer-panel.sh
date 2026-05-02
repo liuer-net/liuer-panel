@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.1"
+readonly VERSION="2.6.2"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -5973,7 +5973,7 @@ main() {
 
         _cron_backup)
             detect_os
-            _run_scheduled_backup "${2:-}" "${3:-7}"
+            _run_scheduled_backup "${2:-}" "${3:-7}" "${4:-1}"
             ;;
 
         # ── Internal API (called non-interactively by liuercp) ────────────────
