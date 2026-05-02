@@ -332,7 +332,6 @@ pm.max_children = 5
 pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 3
-umask = 0007
 php_admin_value[error_log] = /var/log/nginx/${domain}_php_error.log
 php_admin_flag[log_errors] = on
 php_admin_value[open_basedir] = ${site_path}:/tmp:/var/tmp
@@ -2847,7 +2846,7 @@ change_php_version() {
         local new_pool; new_pool=$(get_php_pool_conf "$new_php" "$domain")
         for _k in "php_admin_value[upload_max_filesize]" "php_admin_value[post_max_size]" \
                   "php_value[memory_limit]" "php_admin_value[max_execution_time]" \
-                  "php_admin_value[max_input_time]" "umask"; do
+                  "php_admin_value[max_input_time]"; do
             local _v; _v=$(grep "^${_k} = " "$old_pool" 2>/dev/null | cut -d= -f2- | xargs)
             [[ -n "$_v" ]] && _php_pool_set "$new_pool" "$_k" "$_v" || true
         done
