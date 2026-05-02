@@ -5379,6 +5379,10 @@ _api_create_site() {
     } > "$meta"
     chmod 600 "$meta"
 
+    if [[ -n "$php_ver" ]]; then
+        local _php_svc; _php_svc=$(get_php_service "$php_ver")
+        systemctl reload "$_php_svc" 2>/dev/null || systemctl restart "$_php_svc" 2>/dev/null || true
+    fi
     nginx -t &>/dev/null && nginx -s reload
     lcp_notify "site_created" "\"domain\":\"${domain}\",\"type\":\"${type}\",\"php_version\":\"${php_ver}\""
     log_success "Site created: $domain (user: $site_user)"
