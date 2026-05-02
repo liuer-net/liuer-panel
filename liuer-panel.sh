@@ -5306,6 +5306,382 @@ main_menu() {
 }
 
 # =============================================================================
+# NON-INTERACTIVE API (called by liuercp via lcp_exec_panel)
+# =============================================================================
+
+_api_create_site() {
+    local domain="$1" type="${2:-php}" php_ver="${3:-8.3}"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+    [[ -f "${NGINX_CONF_DIR}/${domain}.conf" ]] && { log_error "Domain already exists: $domain"; exit 1; }
+
+    SELECTED_WEB_USER=""
+    _auto_create_web_user || exit 1
+    local site_user="$SELECTED_WEB_USER"
+    [[ -z "$site_user" ]] && { log_error "Failed to create web user"; exit 1; }
+
+    local site_dir="/home/web/${site_user}/${domain}"
+    local web_root
+    [[ "$type" == "laravel" ]] && web_root="${site_dir}/public" || web_root="${site_dir}/public_html"
+    mkdir -p "$web_root"
+    mkdir -p "${web_root}/.well-known/acme-challenge"
+
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local socket=""
+
+    case "$type" in
+        php)
+            socket=$(get_php_pool_socket "$php_ver" "$domain")
+            nginx_tpl_php "$domain" "$web_root" "$socket" > "$nginx_conf"
+            create_php_pool "$php_ver" "$domain" "$site_user" 0 "$site_dir"
+            printf '<?php echo "<h1>Site is ready!</h1>";\n' > "${web_root}/index.php"
+            ;;
+        laravel)
+            socket=$(get_php_pool_socket "$php_ver" "$domain")
+            nginx_tpl_laravel "$domain" "$web_root" "$socket" > "$nginx_conf"
+            create_php_pool "$php_ver" "$domain" "$site_user" 0 "$site_dir"
+            ;;
+        wordpress)
+            socket=$(get_php_pool_socket "$php_ver" "$domain")
+            nginx_tpl_wordpress "$domain" "$web_root" "$socket" > "$nginx_conf"
+            create_php_pool "$php_ver" "$domain" "$site_user" 0 "$site_dir"
+            ;;
+        static)
+            nginx_tpl_static "$domain" "$web_root" > "$nginx_conf"
+            php_ver=""
+            ;;
+        nodejs)
+            nginx_tpl_static "$domain" "$web_root" > "$nginx_conf"
+            php_ver=""
+            ;;
+        *)
+            log_error "Unknown site type: $type"; exit 1 ;;
+    esac
+
+    _set_site_perms "$site_user" "$domain"
+
+    mkdir -p "$SITES_META_DIR"
+    {
+        echo "DOMAIN=${domain}"
+        echo "TYPE=${type}"
+        [[ -n "$php_ver" ]] && echo "PHP_VERSION=${php_ver}"
+        echo "WEB_USER=${site_user}"
+        echo "SITE_DIR=${site_dir}"
+        echo "INDEX_FILE=index.php"
+        echo "STATUS=active"
+    } > "$meta"
+    chmod 600 "$meta"
+
+    nginx -t &>/dev/null && nginx -s reload
+    lcp_notify "site_created" "\"domain\":\"${domain}\",\"type\":\"${type}\",\"php_version\":\"${php_ver}\""
+    log_success "Site created: $domain (user: $site_user)"
+}
+
+_api_delete_site() {
+    local domain="$1"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local php_ver="" site_user=""
+    [[ -f "$meta" ]] && {
+        php_ver=$(grep "^PHP_VERSION=" "$meta" | cut -d= -f2)
+        site_user=$(grep "^WEB_USER=" "$meta" | cut -d= -f2)
+    }
+
+    rm -f "${NGINX_CONF_DIR}/${domain}.conf" "${NGINX_CONF_DIR}/${domain}.conf.disabled"
+    nginx -t &>/dev/null && nginx -s reload
+
+    [[ -n "$php_ver" ]] && remove_php_pool "$php_ver" "$domain" || true
+
+    local site_dir; site_dir=$(get_site_dir "$domain")
+    [[ -d "$site_dir" ]] && rm -rf "$site_dir"
+
+    rm -f "$meta"
+    lcp_notify "site_deleted" "\"domain\":\"${domain}\""
+    log_success "Site deleted: $domain"
+}
+
+_api_create_db() {
+    local domain="$1" db_type="${2:-mysql}"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+    _create_db_for "$domain" "$db_type"
+}
+
+_api_delete_db() {
+    local domain="$1"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+    _delete_db_for "$domain"
+}
+
+_api_create_sftp() {
+    local domain="$1"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+
+    local sfsite; sfsite="$(get_site_dir "$domain")"
+    [[ ! -d "$sfsite" ]] && { log_error "Site dir not found: $domain"; exit 1; }
+
+    local sfuser sfpass
+    while true; do
+        local rnd; rnd=$(tr -dc 'a-z0-9' < /dev/urandom | head -c8)
+        sfuser="u${rnd}"
+        id "$sfuser" &>/dev/null || break
+    done
+    sfpass=$(rand_str 16)
+
+    local web_user; web_user=$(grep 'WEB_USER=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2)
+    if [[ -n "$web_user" ]]; then
+        useradd -M -d "$sfsite" -s /sbin/nologin -g "$web_user" "$sfuser" 2>/dev/null \
+            || { log_error "Failed to create system user"; exit 1; }
+    else
+        useradd -M -d "$sfsite" -s /sbin/nologin "$sfuser" 2>/dev/null \
+            || { log_error "Failed to create system user"; exit 1; }
+    fi
+
+    echo "${sfuser}:${sfpass}" | chpasswd
+    touch "$SFTP_USERS_FILE" && chmod 600 "$SFTP_USERS_FILE"
+    sed -i "/^${sfuser}|/d" "$SFTP_USERS_FILE" 2>/dev/null || true
+    echo "${sfuser}|$(encrypt_pass "$sfpass")|${domain}" >> "$SFTP_USERS_FILE"
+
+    local sshd="/etc/ssh/sshd_config"
+    if grep -qP '^\s*Subsystem\s+sftp\s+(?!internal-sftp)' "$sshd" 2>/dev/null; then
+        sed -i 's|^\s*Subsystem\s\+sftp\s\+.*|Subsystem sftp internal-sftp|' "$sshd"
+    elif ! grep -q 'Subsystem sftp' "$sshd"; then
+        echo "Subsystem sftp internal-sftp" >> "$sshd"
+    fi
+    if ! grep -q "Match User ${sfuser}" "$sshd"; then
+        printf '\nMatch User %s\n    ForceCommand internal-sftp\n    ChrootDirectory %s\n    PermitTunnel no\n    AllowAgentForwarding no\n    AllowTcpForwarding no\n    X11Forwarding no\n' \
+            "$sfuser" "$sfsite" >> "$sshd"
+    fi
+
+    _repair_sftp_perms
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+
+    lcp_notify "sftp_created" "\"username\":\"${sfuser}\",\"domain\":\"${domain}\",\"password\":\"${sfpass}\""
+    printf '{"username":"%s","password":"%s","chroot":"%s"}\n' "$sfuser" "$sfpass" "$sfsite"
+}
+
+_api_delete_sftp() {
+    local username="$1"
+    [[ -z "$username" ]] && { log_error "Username required"; exit 1; }
+
+    userdel "$username" 2>/dev/null || log_warn "Could not remove system user: $username"
+
+    local tmp; tmp=$(mktemp)
+    awk "/^Match User ${username}$/{skip=7} skip>0{skip--; next} 1" \
+        /etc/ssh/sshd_config > "$tmp" && mv "$tmp" /etc/ssh/sshd_config
+    chmod 600 /etc/ssh/sshd_config
+
+    systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+    sed -i "/^${username}|/d" "$SFTP_USERS_FILE" 2>/dev/null || true
+    lcp_notify "sftp_deleted" "\"username\":\"${username}\""
+    log_success "SFTP user removed: $username"
+}
+
+_api_get_disk_usage() {
+    local domain="$1"
+    [[ -z "$domain" ]] && { echo "0"; exit 0; }
+    local site_dir; site_dir=$(get_site_dir "$domain")
+    [[ -d "$site_dir" ]] && du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0"
+}
+
+_api_set_maintenance() {
+    local domain="$1" action="${2:-enable}"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+
+    if [[ "$action" == "enable" ]]; then
+        [[ -f "${nginx_conf}.premaint" ]] && { log_info "Already in maintenance: $domain"; exit 0; }
+        [[ ! -f "$nginx_conf" ]] && { log_error "Site not found: $domain"; exit 1; }
+        cp "$nginx_conf" "${nginx_conf}.premaint"
+        local _mdir="${CONFIG_DIR}/maintenance"
+        mkdir -p "$_mdir"
+        [[ ! -f "${_mdir}/index.html" ]] && cat > "${_mdir}/index.html" <<'HTML'
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Under Maintenance</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f8f9fa}.card{background:#fff;padding:48px 40px;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.08);text-align:center}h1{font-size:1.5rem;color:#212529;margin-bottom:12px}p{color:#6c757d}</style></head><body><div class="card"><h1>Under Maintenance</h1><p>We'll be back shortly.</p></div></body></html>
+HTML
+        {
+            echo "server {"
+            grep '^\s*listen ' "$nginx_conf" | grep -v 'quic'
+            grep '^\s*server_name ' "$nginx_conf" | head -1
+            grep -q 'ssl_certificate[^_]' "$nginx_conf" \
+                && grep -E '^\s*(ssl_certificate|ssl_certificate_key|ssl_protocols|ssl_ciphers|ssl_session|ssl_prefer|http2 on)' "$nginx_conf"
+            printf '    location ^~ /.well-known/acme-challenge/ { root /var/lib/letsencrypt/http_challenges; default_type text/plain; allow all; }\n'
+            printf '    location / { return 503; }\n'
+            printf '    error_page 503 @maintenance;\n'
+            printf '    location @maintenance { root %s; rewrite ^ /index.html break; }\n' "$_mdir"
+            echo "}"
+        } > "$nginx_conf"
+        log_success "Maintenance ON: $domain"
+    else
+        [[ ! -f "${nginx_conf}.premaint" ]] && { log_info "Not in maintenance: $domain"; exit 0; }
+        mv "${nginx_conf}.premaint" "$nginx_conf"
+        log_success "Maintenance OFF: $domain"
+    fi
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_set_php_version() {
+    local domain="$1" new_php="$2"
+    [[ -z "$domain" || -z "$new_php" ]] && { log_error "Domain and PHP version required"; exit 1; }
+
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$nginx_conf" ]] && { log_error "Site not found: $domain"; exit 1; }
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local old_php; old_php=$(grep "^PHP_VERSION=" "$meta" 2>/dev/null | cut -d= -f2)
+    local site_user; site_user=$(grep "^WEB_USER=" "$meta" 2>/dev/null | cut -d= -f2)
+    local site_path; site_path=$(grep "^SITE_DIR=" "$meta" 2>/dev/null | cut -d= -f2)
+
+    local new_socket; new_socket=$(get_php_pool_socket "$new_php" "$domain")
+    local old_socket; old_socket=$(grep -oP '(?<=fastcgi_pass unix:)[^;]+' "$nginx_conf" 2>/dev/null | head -1 | tr -d ' ' || true)
+
+    [[ "$old_socket" == "$new_socket" ]] && { log_info "Already on PHP $new_php for $domain"; exit 0; }
+
+    local old_pool=""
+    [[ -n "$old_php" ]] && old_pool=$(get_php_pool_conf "$old_php" "$domain" 2>/dev/null || true)
+    create_php_pool "$new_php" "$domain" "$site_user" 0 "$site_path"
+
+    if [[ -n "$old_pool" && -f "$old_pool" ]]; then
+        local new_pool; new_pool=$(get_php_pool_conf "$new_php" "$domain")
+        for _k in "php_admin_value[upload_max_filesize]" "php_admin_value[post_max_size]" \
+                  "php_value[memory_limit]" "php_admin_value[max_execution_time]"; do
+            local _v; _v=$(grep "^${_k} = " "$old_pool" 2>/dev/null | cut -d= -f2- | xargs)
+            [[ -n "$_v" ]] && _php_pool_set "$new_pool" "$_k" "$_v" || true
+        done
+    fi
+
+    sed -i "s|fastcgi_pass unix:${old_socket}|fastcgi_pass unix:${new_socket}|g" "$nginx_conf"
+    sed -i "s|^PHP_VERSION=.*|PHP_VERSION=${new_php}|" "$meta"
+    grep -q "^PHP_VERSION=" "$meta" || echo "PHP_VERSION=${new_php}" >> "$meta"
+
+    nginx -t &>/dev/null && nginx -s reload
+    local svc; svc=$(get_php_service "$new_php")
+    systemctl restart "$svc" 2>/dev/null || true
+    log_success "PHP version changed to $new_php for $domain"
+}
+
+_api_set_routing() {
+    local domain="$1" action="${2:-enable}"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$nginx_conf" ]] && { log_error "Site not found: $domain"; exit 1; }
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local idx; idx=$(grep "^INDEX_FILE=" "$meta" 2>/dev/null | cut -d= -f2)
+    [[ -z "$idx" ]] && idx="index.php"
+
+    if [[ "$action" == "enable" ]]; then
+        sed -i "s|try_files \\\$uri \\\$uri/ =404;|try_files \$uri \$uri/ /${idx}?\$query_string;|" "$nginx_conf"
+        log_success "URL routing enabled for $domain (entry: $idx)"
+    else
+        sed -i "s|try_files \\\$uri \\\$uri/ /[^ ]*?[^;]*;|try_files \$uri \$uri/ =404;|" "$nginx_conf"
+        log_success "URL routing disabled for $domain"
+    fi
+    nginx -t &>/dev/null && nginx -s reload
+}
+
+_api_set_index_file() {
+    local domain="$1" new_idx="$2"
+    [[ -z "$domain" || -z "$new_idx" ]] && { log_error "Domain and index file required"; exit 1; }
+
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ ! -f "$nginx_conf" ]] && { log_error "Site not found: $domain"; exit 1; }
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local routing_on=0
+    grep -q 'try_files.*\.php' "$nginx_conf" && routing_on=1
+
+    sed -i "s|fastcgi_index [^;]*;|fastcgi_index ${new_idx};|g" "$nginx_conf"
+    sed -i "s|index [^ ]* index\.html;|index ${new_idx} index.html;|" "$nginx_conf"
+    if [[ "$routing_on" == "1" ]]; then
+        sed -i "s|try_files \\\$uri \\\$uri/ /[^ ]*?[^;]*;|try_files \$uri \$uri/ /${new_idx}?\$query_string;|" "$nginx_conf"
+    fi
+
+    grep -q "^INDEX_FILE=" "$meta" \
+        && sed -i "s|^INDEX_FILE=.*|INDEX_FILE=${new_idx}|" "$meta" \
+        || echo "INDEX_FILE=${new_idx}" >> "$meta"
+
+    nginx -t &>/dev/null && nginx -s reload
+    log_success "Index file set to $new_idx for $domain"
+}
+
+_api_lock_site() {
+    local domain="$1"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local nginx_dis="${NGINX_CONF_DIR}/${domain}.conf.disabled"
+    local php_ver; php_ver=$(grep "^PHP_VERSION=" "$meta" 2>/dev/null | cut -d= -f2)
+
+    [[ -f "$nginx_conf" ]] && mv "$nginx_conf" "$nginx_dis"
+    if [[ -n "$php_ver" ]]; then
+        local pool_conf; pool_conf=$(get_php_pool_conf "$php_ver" "$domain")
+        [[ -f "$pool_conf" ]] && mv "$pool_conf" "${pool_conf}.disabled"
+        local svc; svc=$(get_php_service "$php_ver")
+        systemctl reload "$svc" 2>/dev/null || true
+    fi
+
+    sed -i "s/^STATUS=.*/STATUS=locked/" "$meta"
+    grep -q "^STATUS=" "$meta" || echo "STATUS=locked" >> "$meta"
+
+    nginx -t &>/dev/null && nginx -s reload
+    log_success "Site locked: $domain"
+}
+
+_api_unlock_site() {
+    local domain="$1"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local nginx_dis="${NGINX_CONF_DIR}/${domain}.conf.disabled"
+    local php_ver; php_ver=$(grep "^PHP_VERSION=" "$meta" 2>/dev/null | cut -d= -f2)
+
+    [[ -f "$nginx_dis" ]] && mv "$nginx_dis" "$nginx_conf"
+    if [[ -n "$php_ver" ]]; then
+        local pool_conf; pool_conf=$(get_php_pool_conf "$php_ver" "$domain")
+        local pool_dis="${pool_conf}.disabled"
+        [[ -f "$pool_dis" ]] && mv "$pool_dis" "$pool_conf"
+        local svc; svc=$(get_php_service "$php_ver")
+        systemctl reload "$svc" 2>/dev/null || true
+    fi
+
+    sed -i "s/^STATUS=.*/STATUS=active/" "$meta"
+    grep -q "^STATUS=" "$meta" || echo "STATUS=active" >> "$meta"
+
+    nginx -t &>/dev/null && nginx -s reload
+    log_success "Site unlocked: $domain"
+}
+
+_api_restart_php() {
+    local domain="$1"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local php_ver; php_ver=$(grep "^PHP_VERSION=" "$meta" 2>/dev/null | cut -d= -f2)
+    [[ -z "$php_ver" ]] && { log_error "No PHP version for site: $domain"; exit 1; }
+
+    local svc; svc=$(get_php_service "$php_ver")
+    systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null \
+        || { log_error "Failed to restart PHP $php_ver"; exit 1; }
+    log_success "PHP $php_ver reloaded for $domain"
+}
+
+_api_request_ssl() {
+    local domain="$1" email="$2"
+    [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+    [[ -z "$email" ]] && { log_error "Email required"; exit 1; }
+
+    local ssl_email_file="${CONFIG_DIR}/ssl_email"
+    echo "$email" > "$ssl_email_file"
+    chmod 600 "$ssl_email_file"
+
+    setup_ssl_free "$domain"
+}
+
+# =============================================================================
 # ENTRY POINT
 # =============================================================================
 main() {
@@ -5386,6 +5762,25 @@ main() {
             detect_os
             _run_scheduled_backup "${2:-}" "${3:-7}"
             ;;
+
+        # ── Internal API (called non-interactively by liuercp) ────────────────
+        create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}"  "${4:-8.3}" ;;
+        delete_site)       check_root; detect_os; _api_delete_site    "${2:-}" ;;
+        create_db)         check_root; detect_os; _api_create_db      "${2:-}" "${3:-mysql}" ;;
+        delete_db)         check_root; detect_os; _api_delete_db      "${2:-}" ;;
+        create_sftp)       check_root; detect_os; _api_create_sftp    "${2:-}" ;;
+        delete_sftp)       check_root; detect_os; _api_delete_sftp    "${2:-}" ;;
+        get_disk_usage)    detect_os;             _api_get_disk_usage "${2:-}" ;;
+        enable_maintenance)  check_root; detect_os; _api_set_maintenance "${2:-}" "enable" ;;
+        disable_maintenance) check_root; detect_os; _api_set_maintenance "${2:-}" "disable" ;;
+        set_php_version)   check_root; detect_os; _api_set_php_version "${2:-}" "${3:-}" ;;
+        enable_routing)    check_root; detect_os; _api_set_routing    "${2:-}" "enable" ;;
+        disable_routing)   check_root; detect_os; _api_set_routing    "${2:-}" "disable" ;;
+        set_index_file)    check_root; detect_os; _api_set_index_file "${2:-}" "${3:-index.php}" ;;
+        lock_site)         check_root; detect_os; _api_lock_site      "${2:-}" ;;
+        unlock_site)       check_root; detect_os; _api_unlock_site    "${2:-}" ;;
+        restart_php)       check_root; detect_os; _api_restart_php    "${2:-}" ;;
+        request_ssl)       check_root; detect_os; _api_request_ssl   "${2:-}" "${3:-}" ;;
 
         # ── Unknown command ───────────────────────────────────────────────────
         *)
