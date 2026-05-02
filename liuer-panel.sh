@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.0"
+readonly VERSION="2.6.1"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -29,6 +29,24 @@ readonly REPO_URL="https://github.com/liuer-net/liuer-panel"
 readonly WEB_USERS_FILE="${CONFIG_DIR}/web_users.txt"
 readonly SFTP_USERS_FILE="${CONFIG_DIR}/sftp_users.txt"
 readonly DANGEROUS_FUNCTIONS="exec,shell_exec,system,passthru,popen,proc_open,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,dl,putenv,show_source,highlight_file"
+
+# Fire-and-forget notification to liuercp so both sides stay in sync.
+# Silent: does nothing if liuercp is not installed or not running.
+lcp_notify() {
+    local action="$1" payload="${2:-}"
+    local cfg="/etc/liuercp/config.ini"
+    [[ -f "$cfg" ]] || return 0
+    local port token
+    port=$(awk -F= '/^\[server\]/{s=1} s && /^[[:space:]]*port[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$cfg")
+    token=$(awk -F= '/^\[panel\]/{s=1} s && /^[[:space:]]*internal_token[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$cfg")
+    [[ -z "$port" || -z "$token" ]] && return 0
+    local body="{\"internal_token\":\"${token}\",\"action\":\"${action}\""
+    [[ -n "$payload" ]] && body="${body},${payload}"
+    body="${body}}"
+    curl -sf --max-time 3 -X POST "http://localhost:${port}/internal/notify" \
+        -H "Content-Type: application/json" \
+        -d "$body" &>/dev/null & disown
+}
 
 # =============================================================================
 # PATH HELPERS  (user-based directory layout: /home/<user>/<domain>)
@@ -1587,6 +1605,11 @@ EOF
         confirm_action "Create a database for ${domain}?" && _create_db_for "$domain" "mysql" || true
     fi
     echo ""
+    lcp_notify "site_created" "\"domain\":\"${domain}\",\"type\":\"${type_name}\",\"php_version\":\"${php_ver:-}\""
+    if [[ -n "$db_name_created" ]]; then
+        local _dctype; _dctype=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null | cut -d'|' -f5)
+        lcp_notify "db_created" "\"domain\":\"${domain}\",\"db_name\":\"${db_name_created}\",\"db_user\":\"${db_user_created}\",\"db_type\":\"${_dctype:-mysql}\""
+    fi
     press_enter
 }
 
@@ -1841,6 +1864,7 @@ delete_website() {
     confirm_action "Also delete the database for ${domain}?" && _delete_db_for "$domain" || true
 
     rm -f "${SITES_META_DIR}/${domain}.conf"
+    lcp_notify "site_deleted" "\"domain\":\"${domain}\""
     log_success "Website ${domain} fully removed."
     press_enter
 }
@@ -2880,6 +2904,7 @@ _create_db_for() {
     local enc_pass
     enc_pass=$(encrypt_pass "$db_pass")
     echo "${domain}|${db_name}|${db_user}|${enc_pass}|${db_type}" >> "$DB_LIST_FILE"
+    lcp_notify "db_created" "\"domain\":\"${domain}\",\"db_name\":\"${db_name}\",\"db_user\":\"${db_user}\",\"db_type\":\"${db_type}\""
 
     log_success "Database created!"
     echo -e "  DB Name : ${BOLD}${db_name}${NC}"
@@ -2912,6 +2937,7 @@ _delete_db_for() {
     esac
 
     sed -i "/^${domain}|/d" "$DB_LIST_FILE"
+    lcp_notify "db_deleted" "\"domain\":\"${domain}\",\"db_name\":\"${_db_name}\""
     log_success "Database removed: $_db_name (user: $_db_user)"
 }
 
@@ -4841,6 +4867,7 @@ EOF
     # Restart sshd (not just reload) to apply Subsystem change
     systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
+    lcp_notify "sftp_created" "\"username\":\"${_sfuser}\",\"domain\":\"${_sfdom}\""
     log_success "SFTP user created!"
     printf "  %-10s: %s\n" "User"     "$_sfuser"
     printf "  %-10s: %s\n" "Password" "$_sfpass"
@@ -4910,6 +4937,7 @@ delete_sftp_user() {
     systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
 
     sed -i "/^${_delu}|/d" "$SFTP_USERS_FILE" 2>/dev/null || true
+    lcp_notify "sftp_deleted" "\"username\":\"${_delu}\""
 
     log_success "SFTP user '${_delu}' removed."
     press_enter
