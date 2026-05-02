@@ -2139,10 +2139,12 @@ HTML
                 echo "    }"
                 echo "}"
             } > "$_conf"
+            lcp_notify "site_updated" "\"domain\":\"${domain}\",\"status\":\"maintenance\""
             log_success "Maintenance mode ON for ${domain}." ;;
         2)
             [[ "$_cur" == "off" ]] && { log_warn "Site is not in maintenance mode."; press_enter; return; }
             mv "${_conf}.premaint" "$_conf"
+            lcp_notify "site_updated" "\"domain\":\"${domain}\",\"status\":\"active\""
             log_success "Maintenance mode OFF for ${domain}." ;;
         0) return ;;
         *) log_warn "Invalid selection."; press_enter; return ;;
@@ -2799,8 +2801,12 @@ manage_site_ssl() {
     local _ch
     echo -ne "${YELLOW}  Select: ${NC}"; read -r _ch
     case "$_ch" in
-        1) setup_ssl_free "$domain" && log_success "SSL installed/renewed for ${domain}." \
-               || log_warn "SSL setup failed. Check DNS and port 80 are accessible." ;;
+        1) if setup_ssl_free "$domain"; then
+               lcp_notify "site_updated" "\"domain\":\"${domain}\",\"ssl_enabled\":true"
+               log_success "SSL installed/renewed for ${domain}."
+           else
+               log_warn "SSL setup failed. Check DNS and port 80 are accessible."
+           fi ;;
         2) setup_ssl_paid "$domain" && log_success "Custom SSL installed for ${domain}." ;;
         0) return ;;
         *) log_warn "Invalid selection." ;;
@@ -2858,6 +2864,7 @@ change_php_version() {
     nginx -s reload
     local new_svc; new_svc=$(get_php_service "$new_php")
     systemctl restart "$new_svc" 2>/dev/null || true
+    lcp_notify "site_updated" "\"domain\":\"${domain}\",\"php_version\":\"${new_php}\""
     log_success "Switched ${domain} to PHP $new_php. Upload/timeout settings carried over."
     press_enter
 }
@@ -4867,7 +4874,7 @@ EOF
     # Restart sshd (not just reload) to apply Subsystem change
     systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
-    lcp_notify "sftp_created" "\"username\":\"${_sfuser}\",\"domain\":\"${_sfdom}\""
+    lcp_notify "sftp_created" "\"username\":\"${_sfuser}\",\"domain\":\"${_sfdom}\",\"password\":\"${_sfpass}\""
     log_success "SFTP user created!"
     printf "  %-10s: %s\n" "User"     "$_sfuser"
     printf "  %-10s: %s\n" "Password" "$_sfpass"
