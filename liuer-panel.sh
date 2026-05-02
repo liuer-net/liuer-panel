@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.3"
+readonly VERSION="2.6.4"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -63,6 +63,19 @@ get_backup_dir() {
     local _usr
     _usr=$(grep "^WEB_USER=" "${SITES_META_DIR}/${_dom}.conf" 2>/dev/null | cut -d= -f2)
     [[ -n "$_usr" ]] && echo "/home/backup/${_usr}/${_dom}" || echo "/backup/${_dom}"
+}
+
+# Resolve the actual backup dir for a domain — handles cases where WEB_USER changed.
+# Prints the path and returns 0 if the dir exists, 1 if it does not.
+_find_backup_dir() {
+    local _dom="$1"
+    local _bdir; _bdir=$(get_backup_dir "$_dom")
+    [[ -d "$_bdir" ]] && { echo "$_bdir"; return 0; }
+    local _alt
+    _alt=$(find "$BACKUP_BASE" -maxdepth 2 -type d -name "$_dom" 2>/dev/null | head -1)
+    [[ -n "$_alt" && -d "$_alt" ]] && { echo "$_alt"; return 0; }
+    [[ -d "/backup/${_dom}" ]] && { echo "/backup/${_dom}"; return 0; }
+    echo "$_bdir"; return 1
 }
 
 # MySQL connection cache (session-scoped)
@@ -4817,22 +4830,24 @@ list_backups() {
 
     local _found=0
     for _dom in "${_domains[@]}"; do
-        local _bdir; _bdir="$(get_backup_dir "$_dom")"
+        local _bdir; _bdir="$(_find_backup_dir "$_dom")" || true
         [[ ! -d "$_bdir" ]] && continue
-        local _files
-        _files=$(ls -lt "$_bdir" 2>/dev/null | grep -v '^total' | grep -v '^d' || true)
-        [[ -z "$_files" ]] && continue
+        local -a _flist=()
+        while IFS= read -r _f; do
+            [[ -z "$_f" ]] && continue
+            _flist+=("$_f")
+        done < <(ls -1t "$_bdir" 2>/dev/null | grep -E '\.(tar\.gz|sql\.gz)$' || true)
+        [[ ${#_flist[@]} -eq 0 ]] && continue
         _found=1
         echo ""
         echo -e "  ${BOLD}${_dom}${NC}  ${DIM}(${_bdir})${NC}"
-        echo -e "  ${DIM}$(printf '%-45s %8s  %s' 'Name' 'Size' 'Date')${NC}"
-        while IFS= read -r _line; do
-            local _fname _fsize _fdate
-            _fname=$(echo "$_line" | awk '{print $NF}')
-            _fsize=$(echo "$_line" | awk '{print $5}')
-            _fdate=$(echo "$_line" | awk '{print $6, $7, $8}')
-            printf "  %-45s %8s  %s\n" "$_fname" "$_fsize" "$_fdate"
-        done <<< "$_files"
+        printf "  ${DIM}%-40s %8s  %s${NC}\n" "Name" "Size" "Date"
+        for _f in "${_flist[@]}"; do
+            local _sz _dt
+            _sz=$(du -sh "${_bdir}/${_f}" 2>/dev/null | cut -f1 || echo "?")
+            _dt=$(date -r "${_bdir}/${_f}" '+%b %d %H:%M' 2>/dev/null || stat -c '%y' "${_bdir}/${_f}" 2>/dev/null | cut -d' ' -f1 || echo "?")
+            printf "  %-40s %8s  %s\n" "$_f" "$_sz" "$_dt"
+        done
     done
 
     [[ "$_found" -eq 0 ]] && log_warn "No backups found."
@@ -4845,7 +4860,7 @@ delete_backup_file() {
 
     _select_domain "Select site" || return 0
     local _dom="$SELECTED_DOMAIN"
-    local _bdir; _bdir="$(get_backup_dir "$_dom")"
+    local _bdir; _bdir="$(_find_backup_dir "$_dom")" || true
 
     [[ ! -d "$_bdir" ]] && { log_warn "No backups for ${_dom}."; press_enter; return; }
 
@@ -6116,6 +6131,73 @@ _api_run_framework() {
     esac
 }
 
+_api_list_site_backups() {
+    local domain="$1"
+    local _bdir; _bdir=$(_find_backup_dir "$domain") || true
+    if [[ ! -d "$_bdir" ]]; then
+        printf '{"backups":[],"dir":""}'; return 0
+    fi
+    local _esc_dir; _esc_dir=$(printf '%s' "$_bdir" | sed 's/"/\\"/g')
+    printf '{"backups":['
+    local _first=1
+    while IFS= read -r _f; do
+        [[ -z "$_f" ]] && continue
+        local _sz; _sz=$(du -sh "${_bdir}/${_f}" 2>/dev/null | cut -f1 || echo "?")
+        local _mt; _mt=$(stat -c '%Y' "${_bdir}/${_f}" 2>/dev/null \
+                         || stat -f '%m' "${_bdir}/${_f}" 2>/dev/null || echo "0")
+        local _esc_f; _esc_f=$(printf '%s' "$_f" | sed 's/"/\\"/g')
+        [[ "$_first" -eq 0 ]] && printf ','
+        printf '{"name":"%s","size":"%s","ts":%s}' "$_esc_f" "$_sz" "$_mt"
+        _first=0
+    done < <(ls -1t "$_bdir" 2>/dev/null | grep -E '\.(tar\.gz|sql\.gz)$' || true)
+    printf '],"dir":"%s"}' "$_esc_dir"
+}
+
+_api_delete_backup_file() {
+    local domain="$1" filename="$2"
+    [[ -z "$filename" ]] && { log_error "Filename required"; exit 1; }
+    [[ "$filename" == */* || "$filename" == ".."* ]] && { log_error "Invalid filename"; exit 1; }
+    local _bdir; _bdir=$(_find_backup_dir "$domain") || { log_error "Backup directory not found"; exit 1; }
+    local _target="${_bdir}/${filename}"
+    [[ ! -f "$_target" ]] && { log_error "File not found: $filename"; exit 1; }
+    rm -f "$_target"
+    log_success "Deleted: $filename"
+}
+
+_api_run_site_backup() {
+    local domain="$1" btype="${2:-1}"
+    local _bdir; _bdir=$(get_backup_dir "$domain")
+    local _sdir; _sdir=$(get_site_dir "$domain")
+    [[ ! -d "$_sdir" ]] && { log_error "Site directory not found: $domain"; exit 1; }
+    local _ts; _ts=$(date +%Y%m%d_%H%M%S)
+    mkdir -p "$_bdir"
+
+    if [[ "$btype" == "1" || "$btype" == "2" ]]; then
+        local _cbk="${_bdir}/code_${_ts}.tar.gz"
+        tar -czf "$_cbk" -C "$(dirname "$_sdir")" "$(basename "$_sdir")" 2>/dev/null \
+            && log_success "Files backup: $(du -sh "$_cbk" | cut -f1)" || log_warn "Files backup failed"
+    fi
+
+    if [[ "$btype" == "1" || "$btype" == "3" ]]; then
+        if [[ -f "$DB_LIST_FILE" ]]; then
+            local _dbline; _dbline=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null || true)
+            if [[ -n "$_dbline" ]]; then
+                local _dbn _enc _dbt
+                IFS='|' read -r _ _dbn _ _enc _dbt <<< "$_dbline"
+                local _dpass; _dpass=$(decrypt_pass "$_enc" 2>/dev/null || echo "")
+                local _dbk="${_bdir}/db_${_ts}.sql.gz"
+                case "$_dbt" in
+                    mysql|mariadb) mysqldump -u root "$_dbn" 2>/dev/null | gzip > "$_dbk" \
+                        && log_success "DB backup: $(du -sh "$_dbk" | cut -f1)" || log_warn "DB backup failed" ;;
+                    postgresql) sudo -u postgres pg_dump "$_dbn" 2>/dev/null | gzip > "$_dbk" \
+                        && log_success "DB backup: $(du -sh "$_dbk" | cut -f1)" || log_warn "DB backup failed" ;;
+                esac
+            fi
+        fi
+    fi
+    log_success "Backup complete → ${_bdir}"
+}
+
 _api_set_maintenance() {
     local domain="$1" action="${2:-enable}"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
@@ -6431,6 +6513,9 @@ main() {
         del_cron)              check_root; detect_os; _api_del_cron             "${2:-}" "${3:-}" ;;
         get_logs)              detect_os;             _api_get_logs              "${2:-}" "${3:-access}" "${4:-100}" ;;
         run_framework)         check_root; detect_os; _api_run_framework         "${2:-}" "${3:-}" "${4:-}" ;;
+        list_site_backups)     detect_os;             _api_list_site_backups     "${2:-}" ;;
+        delete_backup_file)    check_root; detect_os; _api_delete_backup_file   "${2:-}" "${3:-}" ;;
+        run_site_backup)       check_root; detect_os; _api_run_site_backup      "${2:-}" "${3:-1}" ;;
 
         # ── Unknown command ───────────────────────────────────────────────────
         *)
