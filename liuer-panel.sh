@@ -4790,6 +4790,195 @@ schedule_backup() {
     press_enter
 }
 
+list_backups() {
+    print_section "LIST BACKUPS"
+
+    echo -e "\n${BOLD}Show backups for:${NC}"
+    echo "  1) Specific site"
+    echo "  2) All sites"
+    echo "  0) Cancel"
+    local _lopt
+    echo -e "${YELLOW}Select [0-2]:${NC} \c"; read -r _lopt
+    [[ "$_lopt" == "0" ]] && return 0
+
+    local _domains=()
+    if [[ "$_lopt" == "1" ]]; then
+        _select_domain "Select site" || return 0
+        _domains=("$SELECTED_DOMAIN")
+    else
+        while IFS= read -r _c; do
+            [[ -f "$_c" ]] || continue
+            local _d; _d=$(basename "$_c" .conf)
+            [[ "$_d" == "default" || "$_d" == "phpmyadmin" ]] && continue
+            _domains+=("$_d")
+        done < <(ls "${NGINX_CONF_DIR}"/*.conf 2>/dev/null || true)
+        [[ ${#_domains[@]} -eq 0 ]] && { log_warn "No sites found."; press_enter; return; }
+    fi
+
+    local _found=0
+    for _dom in "${_domains[@]}"; do
+        local _bdir; _bdir="$(get_backup_dir "$_dom")"
+        [[ ! -d "$_bdir" ]] && continue
+        local _files
+        _files=$(ls -lt "$_bdir" 2>/dev/null | grep -v '^total' | grep -v '^d' || true)
+        [[ -z "$_files" ]] && continue
+        _found=1
+        echo ""
+        echo -e "  ${BOLD}${_dom}${NC}  ${DIM}(${_bdir})${NC}"
+        echo -e "  ${DIM}$(printf '%-45s %8s  %s' 'Name' 'Size' 'Date')${NC}"
+        while IFS= read -r _line; do
+            local _fname _fsize _fdate
+            _fname=$(echo "$_line" | awk '{print $NF}')
+            _fsize=$(echo "$_line" | awk '{print $5}')
+            _fdate=$(echo "$_line" | awk '{print $6, $7, $8}')
+            printf "  %-45s %8s  %s\n" "$_fname" "$_fsize" "$_fdate"
+        done <<< "$_files"
+    done
+
+    [[ "$_found" -eq 0 ]] && log_warn "No backups found."
+    echo ""
+    press_enter
+}
+
+delete_backup_file() {
+    print_section "DELETE BACKUP FILE"
+
+    _select_domain "Select site" || return 0
+    local _dom="$SELECTED_DOMAIN"
+    local _bdir; _bdir="$(get_backup_dir "$_dom")"
+
+    [[ ! -d "$_bdir" ]] && { log_warn "No backups for ${_dom}."; press_enter; return; }
+
+    local -a _files
+    while IFS= read -r _f; do
+        _files+=("$_f")
+    done < <(ls -1t "$_bdir" 2>/dev/null | grep -v '^$' || true)
+
+    [[ ${#_files[@]} -eq 0 ]] && { log_warn "No backup files found."; press_enter; return; }
+
+    echo ""
+    echo -e "  ${BOLD}Backups for ${_dom}:${NC}"
+    local _i=1
+    for _f in "${_files[@]}"; do
+        local _sz; _sz=$(du -sh "${_bdir}/${_f}" 2>/dev/null | cut -f1 || echo "?")
+        printf "  %2d) %-45s %s\n" "$_i" "$_f" "$_sz"
+        ((_i++)) || true
+    done
+    echo "   0) Cancel"
+
+    local _choice
+    echo -e "\n${YELLOW}Select file to delete [0-$((${#_files[@]}))):${NC} \c"; read -r _choice
+    [[ "$_choice" == "0" || -z "$_choice" ]] && return 0
+    if ! [[ "$_choice" =~ ^[0-9]+$ ]] || [[ "$_choice" -lt 1 ]] || [[ "$_choice" -gt ${#_files[@]} ]]; then
+        log_warn "Invalid selection."; press_enter; return
+    fi
+
+    local _target="${_files[$((_choice-1))]}"
+    confirm_danger "Delete backup file: ${_target}" || { log_info "Cancelled."; return 0; }
+
+    rm -f "${_bdir}/${_target}"
+    log_success "Deleted: ${_target}"
+    press_enter
+}
+
+view_backup_schedules() {
+    print_section "BACKUP SCHEDULES"
+
+    local _raw
+    _raw=$(crontab -l 2>/dev/null | grep "_cron_backup" || true)
+
+    if [[ -z "$_raw" ]]; then
+        log_warn "No backup schedules found."
+        press_enter; return
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Active backup schedules:${NC}"
+    echo ""
+
+    local _idx=1
+    while IFS= read -r _line; do
+        local _cron_expr _domain _keep _btype _label _freq_label
+        _cron_expr=$(echo "$_line" | awk '{print $1,$2,$3,$4,$5}')
+        _domain=$(echo "$_line" | grep -oP '(?<=_cron_backup )\S+')
+        _keep=$(echo "$_line" | grep -oP '(?<=_cron_backup \S{1,64} )\d+')
+        _btype=$(echo "$_line" | grep -oP '(?<=_cron_backup \S{1,64} \d+ )\d')
+
+        case "$_btype" in
+            1) _label="Files + Database" ;;
+            2) _label="Files only" ;;
+            3) _label="Database only" ;;
+            *) _label="Files + Database" ;;
+        esac
+
+        local _dow; _dow=$(echo "$_cron_expr" | awk '{print $5}')
+        [[ "$_dow" == "0" ]] && _freq_label="Weekly (Sunday)" || _freq_label="Daily"
+        local _hh _mm
+        _hh=$(echo "$_cron_expr" | awk '{print $2}')
+        _mm=$(echo "$_cron_expr" | awk '{print $1}')
+
+        printf "  %2d) %-25s Type: %-20s  %s at %02d:%02d  Keep: %s\n" \
+            "$_idx" "${_domain:-all}" "$_label" "$_freq_label" \
+            "${_hh:-0}" "${_mm:-0}" "${_keep:-7}"
+        ((_idx++)) || true
+    done <<< "$_raw"
+
+    echo ""
+    press_enter
+}
+
+remove_backup_schedule() {
+    print_section "REMOVE BACKUP SCHEDULE"
+
+    local _raw
+    _raw=$(crontab -l 2>/dev/null | grep "_cron_backup" || true)
+
+    if [[ -z "$_raw" ]]; then
+        log_warn "No backup schedules found."; press_enter; return
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Active backup schedules:${NC}"
+    echo ""
+
+    local -a _lines
+    local _idx=1
+    while IFS= read -r _line; do
+        _lines+=("$_line")
+        local _domain _keep _btype _label _freq_label _hh _mm _dow _cron_expr
+        _cron_expr=$(echo "$_line" | awk '{print $1,$2,$3,$4,$5}')
+        _domain=$(echo "$_line" | grep -oP '(?<=_cron_backup )\S+')
+        _keep=$(echo "$_line" | grep -oP '(?<=_cron_backup \S{1,64} )\d+')
+        _btype=$(echo "$_line" | grep -oP '(?<=_cron_backup \S{1,64} \d+ )\d')
+        case "$_btype" in
+            1) _label="Files + Database" ;; 2) _label="Files only" ;; 3) _label="Database only" ;; *) _label="Files + Database" ;;
+        esac
+        _dow=$(echo "$_cron_expr" | awk '{print $5}')
+        [[ "$_dow" == "0" ]] && _freq_label="Weekly (Sunday)" || _freq_label="Daily"
+        _hh=$(echo "$_cron_expr" | awk '{print $2}')
+        _mm=$(echo "$_cron_expr" | awk '{print $1}')
+        printf "  %2d) %-25s Type: %-20s  %s at %02d:%02d  Keep: %s\n" \
+            "$_idx" "${_domain:-all}" "$_label" "$_freq_label" \
+            "${_hh:-0}" "${_mm:-0}" "${_keep:-7}"
+        ((_idx++)) || true
+    done <<< "$_raw"
+
+    echo "   0) Cancel"
+
+    local _choice
+    echo -e "\n${YELLOW}Select schedule to remove [0-$((${#_lines[@]}))):${NC} \c"; read -r _choice
+    [[ "$_choice" == "0" || -z "$_choice" ]] && return 0
+    if ! [[ "$_choice" =~ ^[0-9]+$ ]] || [[ "$_choice" -lt 1 ]] || [[ "$_choice" -gt ${#_lines[@]} ]]; then
+        log_warn "Invalid selection."; press_enter; return
+    fi
+
+    local _entry="${_lines[$((_choice-1))]}"
+    local _escaped_entry; _escaped_entry=$(printf '%s\n' "$_entry" | sed 's/[[\.*^$()+?{|]/\\&/g')
+    (crontab -l 2>/dev/null | grep -v -F "$_entry") | crontab -
+    log_success "Schedule removed."
+    press_enter
+}
+
 # =============================================================================
 # SFTP USER
 # =============================================================================
@@ -5207,11 +5396,19 @@ menu_backup() {
         echo "   1  Backup site now"
         echo "   2  Restore backup"
         echo "   3  Schedule auto backup"
+        echo "   4  View backup schedules"
+        echo "   5  Remove backup schedule"
+        echo "   6  List backup files"
+        echo "   7  Delete backup file"
         _sub_footer; read -r _ch
         case "$_ch" in
             1) backup_website ;;
             2) restore_backup ;;
             3) schedule_backup ;;
+            4) view_backup_schedules ;;
+            5) remove_backup_schedule ;;
+            6) list_backups ;;
+            7) delete_backup_file ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
