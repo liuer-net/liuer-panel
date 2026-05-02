@@ -5316,7 +5316,7 @@ manage_site_users() {
         # SFTP users for this site
         echo -e "\n  ${BOLD}── SFTP Users ────────────────────────────${NC}"
         local _sftp_found=0
-        while IFS= read -r _line; do
+            while IFS= read -r _line; do
             local _su; _su=$(echo "$_line" | grep -oP '(?<=Match User )\S+')
             [[ -z "$_su" ]] && continue
             local _sd; _sd=$(grep -A5 "Match User ${_su}" /etc/ssh/sshd_config 2>/dev/null \
