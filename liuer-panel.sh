@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.4"
+readonly VERSION="2.6.5"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -922,7 +922,16 @@ _save_web_user() {
 }
 
 _auto_create_web_user() {
-    local _username="web$(rand_str 8)"
+    local _prefix=""
+    if [[ -n "${SELECTED_DOMAIN:-}" ]]; then
+        _prefix=$(echo "$SELECTED_DOMAIN" | cut -d. -f1 \
+                  | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-10)
+    fi
+    [[ -z "$_prefix" ]] && _prefix="web"
+    local _username="${_prefix}_$(rand_str 6)"
+    while id "$_username" &>/dev/null 2>&1; do
+        _username="${_prefix}_$(rand_str 6)"
+    done
     local _password; _password=$(rand_str 20)
     _save_web_user "$_username" "$_password" "0" || return 1
     log_success "Web user created: ${_username}"
