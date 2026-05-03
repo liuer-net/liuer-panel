@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.8"
+readonly VERSION="2.6.9"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -5648,13 +5648,21 @@ _api_create_db() {
     db_line=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null | tail -1)
     [[ -z "$db_line" ]] && { log_error "Failed to read db info"; exit 1; }
     IFS='|' read -r _ _db_name _db_user _enc _type <<< "$db_line"
-    printf '{"db_name":"%s","db_user":"%s","db_type":"%s"}\n' "$_db_name" "$_db_user" "${_type:-$db_type}"
+    printf '{"db_name":"%s","db_user":"%s","db_type":"%s","db_password":"%s"}\n' "$_db_name" "$_db_user" "${_type:-$db_type}" "$_enc"
 }
 
 _api_delete_db() {
     local domain="$1"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
     _delete_db_for "$domain"
+}
+
+_api_decrypt_value() {
+    local enc="$1"
+    [[ -z "$enc" ]] && { printf '{"error":"no value"}\n'; exit 1; }
+    local plain
+    plain=$(decrypt_pass "$enc" 2>/dev/null) || { printf '{"error":"decrypt failed"}\n'; exit 1; }
+    printf '{"password":"%s"}\n' "$plain"
 }
 
 _api_create_sftp() {
@@ -6526,6 +6534,7 @@ main() {
         delete_site)       check_root; detect_os; _api_delete_site    "${2:-}" ;;
         create_db)         check_root; detect_os; _api_create_db      "${2:-}" "${3:-mysql}" ;;
         delete_db)         check_root; detect_os; _api_delete_db      "${2:-}" ;;
+        decrypt_value)                            _api_decrypt_value  "${2:-}" ;;
         create_sftp)       check_root; detect_os; _api_create_sftp    "${2:-}" ;;
         delete_sftp)       check_root; detect_os; _api_delete_sftp    "${2:-}" ;;
         get_disk_usage)    detect_os;             _api_get_disk_usage "${2:-}" ;;
