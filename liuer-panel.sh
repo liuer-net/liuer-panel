@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.9"
+readonly VERSION="2.6.10"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -688,7 +688,7 @@ prompt_default() {
 
 rand_str() {
     local len="${1:-16}"
-    tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$len" || true
+    tr -dc 'a-zA-Z0-9!@%^*_+' < /dev/urandom 2>/dev/null | head -c "$len" || true
 }
 
 # =============================================================================
@@ -5662,7 +5662,9 @@ _api_decrypt_value() {
     [[ -z "$enc" ]] && { printf '{"error":"no value"}\n'; exit 1; }
     local plain
     plain=$(decrypt_pass "$enc" 2>/dev/null) || { printf '{"error":"decrypt failed"}\n'; exit 1; }
-    printf '{"password":"%s"}\n' "$plain"
+    local escaped="${plain//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    printf '{"password":"%s"}\n' "$escaped"
 }
 
 _api_create_sftp() {
