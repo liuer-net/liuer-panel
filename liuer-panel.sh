@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.10"
+readonly VERSION="2.6.11"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -688,6 +688,11 @@ prompt_default() {
 
 rand_str() {
     local len="${1:-16}"
+    tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$len" || true
+}
+
+rand_pass() {
+    local len="${1:-20}"
     tr -dc 'a-zA-Z0-9!@%^*_+' < /dev/urandom 2>/dev/null | head -c "$len" || true
 }
 
@@ -932,7 +937,7 @@ _auto_create_web_user() {
     while id "$_username" &>/dev/null 2>&1; do
         _username="${_prefix}_$(rand_str 6)"
     done
-    local _password; _password=$(rand_str 20)
+    local _password; _password=$(rand_pass 20)
     _save_web_user "$_username" "$_password" "0" || return 1
     log_success "Web user created: ${_username}"
 }
@@ -1391,7 +1396,7 @@ PHP
             local _ldb_name _ldb_user _ldb_pass
             _ldb_name="db_$(echo "$domain" | tr '.-' '_' | cut -c1-12)_$(rand_str 4)"
             _ldb_user="u_$(rand_str 10)"
-            _ldb_pass=$(rand_str 24)
+            _ldb_pass=$(rand_pass 24)
             _ldb_name="${_ldb_name,,}"
             _ldb_user="${_ldb_user,,}"
 
@@ -1504,7 +1509,7 @@ PHP
                 local _db_name _db_user _db_pass
                 _db_name="db_$(echo "$domain" | tr '.-' '_' | cut -c1-12)_$(rand_str 4)"
                 _db_user="u_$(rand_str 10)"
-                _db_pass=$(rand_str 24)
+                _db_pass=$(rand_pass 24)
                 _db_name="${_db_name,,}"
                 _db_user="${_db_user,,}"
 
@@ -2908,7 +2913,7 @@ _create_db_for() {
     local db_name="db_$(echo "$domain" | tr '.-' '_' | cut -c1-14)_$(rand_str 4)"
     local db_user="u_$(rand_str 10)"
     local db_pass
-    db_pass=$(rand_str 24)
+    db_pass=$(rand_pass 24)
     db_name="${db_name,,}"
     db_user="${db_user,,}"
 
@@ -4196,7 +4201,7 @@ install_phpmyadmin() {
 
     # Create a dedicated MySQL user for phpMyAdmin (password auth, avoids unix_socket issue)
     local pma_db_user="pma_$(rand_str 8)"
-    local pma_db_pass; pma_db_pass=$(rand_str 20)
+    local pma_db_pass; pma_db_pass=$(rand_pass 20)
     mysql -u root 2>/dev/null <<SQL
 CREATE USER IF NOT EXISTS '${pma_db_user}'@'localhost' IDENTIFIED BY '${pma_db_pass}';
 GRANT ALL PRIVILEGES ON *.* TO '${pma_db_user}'@'localhost' WITH GRANT OPTION;
@@ -5032,7 +5037,7 @@ create_sftp_user() {
                 _sfuser="u${_rnd}"
                 id "$_sfuser" &>/dev/null || break
             done
-            _sfpass=$(rand_str 16)
+            _sfpass=$(rand_pass 16)
             ;;
         2)
             echo -ne "  SFTP username: "; read -r _sfuser
@@ -5041,7 +5046,7 @@ create_sftp_user() {
                 press_enter; return 1
             }
             id "$_sfuser" &>/dev/null && { log_error "User '$_sfuser' already exists."; press_enter; return 1; }
-            _sfpass=$(rand_str 16)
+            _sfpass=$(rand_pass 16)
             ;;
         0|*) return ;;
     esac
@@ -5680,7 +5685,7 @@ _api_create_sftp() {
         sfuser="u${rnd}"
         id "$sfuser" &>/dev/null || break
     done
-    sfpass=$(rand_str 16)
+    sfpass=$(rand_pass 16)
 
     local web_user; web_user=$(grep 'WEB_USER=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2)
     if [[ -n "$web_user" ]]; then
