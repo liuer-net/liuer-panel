@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.6"
+readonly VERSION="2.6.7"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -5548,6 +5548,7 @@ _api_create_site() {
     [[ -f "${NGINX_CONF_DIR}/${domain}.conf" ]] && { log_error "Domain already exists: $domain"; exit 1; }
 
     SELECTED_WEB_USER=""
+    SELECTED_DOMAIN="$domain"
     _auto_create_web_user || exit 1
     local site_user="$SELECTED_WEB_USER"
     [[ -z "$site_user" ]] && { log_error "Failed to create web user"; exit 1; }
@@ -5600,6 +5601,7 @@ _api_create_site() {
         [[ -n "$php_ver" ]] && echo "PHP_VERSION=${php_ver}"
         echo "WEB_USER=${site_user}"
         echo "SITE_DIR=${site_dir}"
+        echo "WEB_ROOT=${web_root}"
         echo "INDEX_FILE=index.php"
         echo "STATUS=active"
     } > "$meta"
