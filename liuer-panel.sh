@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.5"
+readonly VERSION="2.6.6"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -5641,7 +5641,12 @@ _api_delete_site() {
 _api_create_db() {
     local domain="$1" db_type="${2:-mysql}"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
-    _create_db_for "$domain" "$db_type"
+    _create_db_for "$domain" "$db_type" >&2 || exit 1
+    local db_line _db_name _db_user _enc _type
+    db_line=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null | tail -1)
+    [[ -z "$db_line" ]] && { log_error "Failed to read db info"; exit 1; }
+    IFS='|' read -r _ _db_name _db_user _enc _type <<< "$db_line"
+    printf '{"db_name":"%s","db_user":"%s","db_type":"%s"}\n' "$_db_name" "$_db_user" "${_type:-$db_type}"
 }
 
 _api_delete_db() {
@@ -6173,6 +6178,34 @@ _api_delete_backup_file() {
     log_success "Deleted: $filename"
 }
 
+
+_api_zip_path() {
+    local domain="$1" abs_path="$2"
+    [[ -z "$domain" || -z "$abs_path" ]] && { log_error "Domain and path required"; exit 1; }
+    local site_dir; site_dir=$(get_site_dir "$domain")
+    [[ "$abs_path" != "${site_dir}"* ]] && { log_error "Path not allowed"; exit 1; }
+    [[ ! -e "$abs_path" ]] && { log_error "Path not found: $abs_path"; exit 1; }
+    local base_name="${abs_path##*/}"
+    local zip_name="${base_name}.zip"
+    local parent_dir; parent_dir="$(dirname "$abs_path")"
+    local zip_full="${parent_dir}/${zip_name}"
+    cd "$parent_dir" && zip -r "$zip_full" "$base_name" >/dev/null 2>&1
+    printf '{"zip_name":"%s"}\n' "$zip_name"
+}
+
+_api_unzip_path() {
+    local domain="$1" abs_zip="$2" abs_dest="${3:-}"
+    [[ -z "$domain" || -z "$abs_zip" ]] && { log_error "Domain and zip path required"; exit 1; }
+    local site_dir; site_dir=$(get_site_dir "$domain")
+    [[ "$abs_zip" != "${site_dir}"* ]] && { log_error "Zip path not allowed"; exit 1; }
+    [[ ! -f "$abs_zip" ]] && { log_error "File not found: $abs_zip"; exit 1; }
+    [[ -z "$abs_dest" ]] && abs_dest="$(dirname "$abs_zip")"
+    [[ "$abs_dest" != "${site_dir}"* ]] && { log_error "Dest path not allowed"; exit 1; }
+    mkdir -p "$abs_dest"
+    unzip -o "$abs_zip" -d "$abs_dest" >/dev/null 2>&1
+    echo '{"ok":true}'
+}
+
 _api_run_site_backup() {
     local domain="$1" btype="${2:-1}"
     local _bdir; _bdir=$(get_backup_dir "$domain")
@@ -6525,6 +6558,8 @@ main() {
         list_site_backups)     detect_os;             _api_list_site_backups     "${2:-}" ;;
         delete_backup_file)    check_root; detect_os; _api_delete_backup_file   "${2:-}" "${3:-}" ;;
         run_site_backup)       check_root; detect_os; _api_run_site_backup      "${2:-}" "${3:-1}" ;;
+        zip_path)              check_root;            _api_zip_path   "${2:-}" "${3:-}"        ;;
+        unzip_path)            check_root;            _api_unzip_path "${2:-}" "${3:-}" "${4:-.}" ;;
 
         # ── Unknown command ───────────────────────────────────────────────────
         *)
