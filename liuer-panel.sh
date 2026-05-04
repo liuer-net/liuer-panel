@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.12"
+readonly VERSION="2.6.13"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -6257,6 +6257,44 @@ _api_run_site_backup() {
     log_success "Backup complete → ${_bdir}"
 }
 
+_api_restore_backup_file() {
+    local domain="$1" filename="$2"
+    [[ -z "$domain" || -z "$filename" ]] && { printf '{"error":"domain and filename required"}\n'; exit 1; }
+    [[ "$filename" == */* || "$filename" == ".."* ]] && { printf '{"error":"invalid filename"}\n'; exit 1; }
+
+    local _bdir; _bdir=$(_find_backup_dir "$domain") || { printf '{"error":"backup dir not found"}\n'; exit 1; }
+    local _target="${_bdir}/${filename}"
+    [[ ! -f "$_target" ]] && { printf '{"error":"file not found"}\n'; exit 1; }
+
+    if [[ "$filename" == code_*.tar.gz ]]; then
+        local _sdir; _sdir=$(get_site_dir "$domain")
+        local _parent; _parent=$(dirname "$_sdir")
+        rm -rf "${_sdir:?}"
+        tar -xzf "$_target" -C "$_parent" 2>/dev/null \
+            || { printf '{"error":"file restore failed"}\n'; exit 1; }
+        _set_site_perms "$(basename "$_sdir" | cut -d/ -f1)" "$domain" 2>/dev/null || true
+
+    elif [[ "$filename" == db_*.sql.gz ]]; then
+        local _dbline; _dbline=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null || true)
+        [[ -z "$_dbline" ]] && { printf '{"error":"no database found for domain"}\n'; exit 1; }
+        local _dbn _dbu _enc _dbt
+        IFS='|' read -r _ _dbn _dbu _enc _dbt <<< "$_dbline"
+        case "$_dbt" in
+            mysql|mariadb)
+                zcat "$_target" | mysql -u root "$_dbn" 2>/dev/null \
+                    || { printf '{"error":"database restore failed"}\n'; exit 1; } ;;
+            postgresql|pgsql)
+                zcat "$_target" | sudo -u postgres psql "$_dbn" >/dev/null 2>&1 \
+                    || { printf '{"error":"database restore failed"}\n'; exit 1; } ;;
+            *) printf '{"error":"unsupported db type"}\n'; exit 1 ;;
+        esac
+    else
+        printf '{"error":"unknown backup file type"}\n'; exit 1
+    fi
+
+    printf '{"ok":true}\n'
+}
+
 _api_set_maintenance() {
     local domain="$1" action="${2:-enable}"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
@@ -6573,9 +6611,10 @@ main() {
         del_cron)              check_root; detect_os; _api_del_cron             "${2:-}" "${3:-}" ;;
         get_logs)              detect_os;             _api_get_logs              "${2:-}" "${3:-access}" "${4:-100}" ;;
         run_framework)         check_root; detect_os; _api_run_framework         "${2:-}" "${3:-}" "${4:-}" ;;
-        list_site_backups)     detect_os;             _api_list_site_backups     "${2:-}" ;;
-        delete_backup_file)    check_root; detect_os; _api_delete_backup_file   "${2:-}" "${3:-}" ;;
-        run_site_backup)       check_root; detect_os; _api_run_site_backup      "${2:-}" "${3:-1}" ;;
+        list_site_backups)       detect_os;             _api_list_site_backups       "${2:-}" ;;
+        delete_backup_file)      check_root; detect_os; _api_delete_backup_file     "${2:-}" "${3:-}" ;;
+        run_site_backup)         check_root; detect_os; _api_run_site_backup        "${2:-}" "${3:-1}" ;;
+        restore_backup_file)     check_root; detect_os; _api_restore_backup_file    "${2:-}" "${3:-}" ;;
         zip_path)              check_root;            _api_zip_path   "${2:-}" "${3:-}"        ;;
         unzip_path)            check_root;            _api_unzip_path "${2:-}" "${3:-}" "${4:-.}" ;;
 
