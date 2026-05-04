@@ -5743,6 +5743,18 @@ _api_get_disk_usage() {
     [[ -d "$site_dir" ]] && du -sb "$site_dir" 2>/dev/null | cut -f1 || echo "0"
 }
 
+_api_get_user_disk_total() {
+    local _total=0 _domain _sdir _sz
+    for _domain in "$@"; do
+        [[ -z "$_domain" ]] && continue
+        _sdir=$(get_site_dir "$_domain" 2>/dev/null) || continue
+        [[ -d "$_sdir" ]] || continue
+        _sz=$(du -sb "$_sdir" 2>/dev/null | cut -f1)
+        _total=$(( _total + ${_sz:-0} ))
+    done
+    printf '{"disk_bytes":%d}\n' "$_total"
+}
+
 _api_get_advanced_settings() {
     # Returns JSON with current state of gzip, static_cache, hardening, http_protocol, redirect, basic_auth
     local domain="$1"
@@ -6582,7 +6594,8 @@ main() {
         decrypt_value)                            _api_decrypt_value  "${2:-}" ;;
         create_sftp)       check_root; detect_os; _api_create_sftp    "${2:-}" ;;
         delete_sftp)       check_root; detect_os; _api_delete_sftp    "${2:-}" ;;
-        get_disk_usage)    detect_os;             _api_get_disk_usage "${2:-}" ;;
+        get_disk_usage)       detect_os; _api_get_disk_usage "${2:-}" ;;
+        get_user_disk_total)  check_root; detect_os; _api_get_user_disk_total "${@:2}" ;;
         enable_maintenance)  check_root; detect_os; _api_set_maintenance "${2:-}" "enable" ;;
         disable_maintenance) check_root; detect_os; _api_set_maintenance "${2:-}" "disable" ;;
         set_php_version)   check_root; detect_os; _api_set_php_version "${2:-}" "${3:-}" ;;
