@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.11"
+readonly VERSION="2.6.12"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -449,7 +449,7 @@ _repair_sftp_perms() {
                         2>/dev/null | cut -d= -f2)
                     if [[ -n "$_pver" ]]; then
                         local _pool; _pool=$(get_php_pool_conf "$_pver" "$_dom")
-                        [[ -f "$_pool" ]] && _php_pool_set "$_pool" "umask" "0007" || true
+                        [[ -f "$_pool" ]] && [[ "${OS_FAMILY:-}" == "debian" ]] && _php_pool_set "$_pool" "umask" "0007" || true
                     fi
                 fi
                 find "$_croot" -mindepth 1 -type d -exec chmod 770 {} \; 2>/dev/null || true
